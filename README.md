@@ -59,6 +59,33 @@ Then send the bot a direct message and reply `/bind choose-a-code`.
 `node bin/dsh-weixin.mjs status` and `node bin/dsh-weixin.mjs logout` are also
 available; `login` never starts a poller, so restart the Host afterwards.
 
+## Run as a user service
+
+The channel lives inside the Host, so the supervised process is `dsh web`, not a
+separate daemon. The unit in `deploy/systemd/` keeps it running after the
+terminal closes and across reboots:
+
+```sh
+deploy/systemd/install.sh                 # install, enable, start
+journalctl --user -u dsh-weixin-gateway -f
+```
+
+It starts in `workspace/` and passes `--no-open`, so no browser is launched at
+boot; the UI is still served on `127.0.0.1:3080` and its URL is printed to the
+journal. It retries every 10 s without ever latching into `failed`, and allows
+45 s to shut down. Optional overrides go in
+`~/.config/dsh-weixin-gateway.env`, mode `0600`:
+
+```sh
+DSH_WEIXIN_BIND_CODE=choose-a-code
+```
+
+Restart the unit after editing that file: `/bind` reads the variable from the
+process environment. `loginctl enable-linger "$USER"` is what lets the Host
+start at boot without a login; the installer warns when lingering is off. Stop
+the unit before running `dsh web` by hand — a second poller trips iLink's `-14`
+guard.
+
 ## Commands
 
 | Command | Behaviour |
