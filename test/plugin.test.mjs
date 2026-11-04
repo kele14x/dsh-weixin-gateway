@@ -67,3 +67,17 @@ test('a valid config injects sessionController and mounts a disposable effect', 
 
   await record.disposers[0]()
 })
+
+test('an empty defaultCwd falls back to the plugin workspace directory', async (t) => {
+  const dir = await makeTempDir('plugin')
+  t.after(() => cleanup(dir))
+
+  const { ctx, record } = fakeCtx()
+  apply(ctx, { stateDir: dir, defaultCwd: '', logLevel: 'silent' })
+
+  const { existsSync } = await import('node:fs')
+  const { defaultWorkspace } = await import('../src/index.mjs')
+  assert.equal(existsSync(defaultWorkspace()), true)
+  assert.deepEqual(record.injected, ['sessionController'])
+  await record.disposers[0]()
+})

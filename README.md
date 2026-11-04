@@ -42,6 +42,10 @@ dsh web
 The package declares `dsh.bundle.patch`, so the install registers it as a profile
 layer automatically.
 
+Sessions default to `<plugin>/workspace`. Start `dsh web` from that directory so
+DSH's sandbox root matches it, or set `DSH_WEIXIN_CWD` to the directory you
+launch from.
+
 ## Log in and pair
 
 ```sh
@@ -70,13 +74,14 @@ Anything else is sent to the agent as a prompt.
 
 ## Configuration
 
-Set on the plugin row. `stateDir` and `defaultCwd` are required and must be
-absolute.
+Set on the plugin row. `stateDir` is required and must be absolute.
+`defaultCwd` is optional: empty (the default) uses the plugin's own `workspace/`
+directory, and `DSH_WEIXIN_CWD` overrides it.
 
 | Key | Default | Purpose |
 |---|---|---|
 | `stateDir` | — | credentials, cursor, allowlist, lock |
-| `defaultCwd` | — | workspace for new sessions |
+| `defaultCwd` | `<plugin>/workspace` | workspace for new sessions |
 | `agentPreset` | — | preset for new sessions |
 | `maxMessageChars` | `1800` | outbound chunk size |
 | `bindCodeEnv` | `DSH_WEIXIN_BIND_CODE` | pairing-code variable |

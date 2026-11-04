@@ -8,8 +8,9 @@
  * @module dsh-weixin-gateway
  */
 
-import { isAbsolute } from 'node:path'
-import { statSync } from 'node:fs'
+import { isAbsolute, join, resolve } from 'node:path'
+import { mkdirSync, statSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
 import { Config } from './config.mjs'
 import { createLogger } from './util/log.mjs'
 import { createHost } from './bridge/host.mjs'
@@ -17,6 +18,18 @@ import { Gateway } from './runtime.mjs'
 
 export const name = 'dsh-weixin-gateway'
 export { Config }
+
+/** Repository/package root, derived from this module's location. */
+const PACKAGE_ROOT = fileURLToPath(new URL('..', import.meta.url))
+
+/**
+ * Default directory for sessions this channel creates.
+ *
+ * @returns {string} absolute path to the plugin's `workspace/` directory.
+ */
+export function defaultWorkspace() {
+  return join(PACKAGE_ROOT, 'workspace')
+}
 
 /**
  * Check that a configured directory exists.
@@ -52,18 +65,31 @@ export function apply(ctx, config) {
     })
     return
   }
-  if (typeof config.defaultCwd !== 'string' || !isAbsolute(config.defaultCwd)) {
-    logger.error('defaultCwd must be an absolute path; the WeChat channel is disabled', {
-      defaultCwd: config.defaultCwd,
-    })
-    return
+  const configuredCwd = typeof config.defaultCwd === 'string' ? config.defaultCwd.trim() : ''
+  let defaultCwd
+  if (configuredCwd.length > 0) {
+    defaultCwd = resolve(configuredCwd)
+    if (!isAbsolute(defaultCwd) || !isDirectory(defaultCwd)) {
+      logger.error('defaultCwd is not an existing directory; the WeChat channel is disabled', {
+        defaultCwd,
+      })
+      return
+    }
+  } else {
+    // No explicit workspace: keep WeChat files beside the plugin instead of in
+    // whatever directory the Host was launched from.
+    defaultCwd = defaultWorkspace()
+    try {
+      mkdirSync(defaultCwd, { recursive: true, mode: 0o700 })
+    } catch (error) {
+      logger.error('could not create the plugin workspace directory; the WeChat channel is disabled', {
+        defaultCwd,
+        reason: error.message,
+      })
+      return
+    }
   }
-  if (!isDirectory(config.defaultCwd)) {
-    logger.error('defaultCwd is not an existing directory; the WeChat channel is disabled', {
-      defaultCwd: config.defaultCwd,
-    })
-    return
-  }
+  const resolvedConfig = { ...config, defaultCwd }
 
   ctx.inject(['sessionController'], (child) => {
     child.effect(() => {
@@ -71,7 +97,7 @@ export function apply(ctx, config) {
       let starting
       try {
         const host = createHost(child, { logger })
-        gateway = new Gateway({ config, host, logger })
+        gateway = new Gateway({ config: resolvedConfig, host, logger })
         starting = gateway.start().catch((error) => {
           logger.error('the WeChat gateway failed to start', error)
         })

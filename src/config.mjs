@@ -25,8 +25,10 @@ export const Config = z.object({
     .description('Directory for credentials, poll cursor, allowlist, and the poller lock.'),
   defaultCwd: z
     .string()
-    .required()
-    .description('Working directory assigned to DSH sessions created for WeChat senders.'),
+    .default('')
+    .description(
+      'Working directory for sessions created for WeChat senders. Empty uses the plugin workspace/ directory.',
+    ),
   agentPreset: z
     .string()
     .description('Optional DSH agent preset for sessions this channel creates.'),
