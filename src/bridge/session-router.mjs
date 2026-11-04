@@ -26,7 +26,7 @@ export class SessionRouter {
     this.defaultCwd = defaultCwd
     this.agentPreset = agentPreset
     this.logger = logger
-    /** @type {Map<string, Promise<object>>} in-flight creations per sender */
+    /** @type {Map<string, Promise<object>>} in-flight operations per sender */
     this.inflight = new Map()
   }
 
@@ -37,18 +37,17 @@ export class SessionRouter {
    * @returns {Promise<{sessionId: string, cwd: string, created: boolean}>} resolved mapping.
    */
   async sessionFor(userId) {
-    const existing = this.state.sessionFor(userId)
-    if (existing !== undefined) {
-      await this.state.touchSession(userId)
-      return { sessionId: existing.sessionId, cwd: existing.cwd, created: false }
-    }
-
     const running = this.inflight.get(userId)
     if (running !== undefined) return running
 
-    const creation = this.#create(userId).finally(() => this.inflight.delete(userId))
-    this.inflight.set(userId, creation)
-    return creation
+    return this.#enqueue(userId, async () => {
+      const existing = this.state.sessionFor(userId)
+      if (existing !== undefined) {
+        await this.state.touchSession(userId)
+        return { sessionId: existing.sessionId, cwd: existing.cwd, created: false }
+      }
+      return this.#create(userId)
+    })
   }
 
   /**
@@ -58,14 +57,26 @@ export class SessionRouter {
    * @returns {Promise<{sessionId: string, cwd: string, created: true}>} new mapping.
    */
   async reset(userId) {
-    const previous = this.state.sessionFor(userId)
-    const created = await this.#create(userId)
-    this.logger.info('replaced session mapping', {
-      userId,
-      previousSessionId: previous?.sessionId,
-      sessionId: created.sessionId,
+    return this.#enqueue(userId, async () => {
+      const previous = this.state.sessionFor(userId)
+      const created = await this.#create(userId)
+      this.logger.info('replaced session mapping', {
+        userId,
+        previousSessionId: previous?.sessionId,
+        sessionId: created.sessionId,
+      })
+      return created
     })
-    return created
+  }
+
+  #enqueue(userId, operation) {
+    const previous = this.inflight.get(userId) ?? Promise.resolve()
+    const queued = previous.catch(() => {}).then(operation)
+    const running = queued.finally(() => {
+      if (this.inflight.get(userId) === running) this.inflight.delete(userId)
+    })
+    this.inflight.set(userId, running)
+    return running
   }
 
   /**

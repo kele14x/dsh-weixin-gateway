@@ -16,7 +16,7 @@
 import { randomUUID } from 'node:crypto'
 import { join } from 'node:path'
 import { splitText } from './util/chunk.mjs'
-import { sleep } from './util/time.mjs'
+import { sleep, raceAbort } from './util/time.mjs'
 import { silentLogger } from './util/log.mjs'
 import { normalizeInbound, isGroupMessage } from './ilink/messages.mjs'
 import { ILinkClient } from './ilink/client.mjs'
@@ -75,6 +75,9 @@ export class Gateway {
     this.lockRetryMs = lockRetryMs
     this.pauseHeartbeatMs = pauseHeartbeatMs
     this.lockRetryTimer = undefined
+    this.startPromise = undefined
+    this.stopPromise = undefined
+    this.drainPromises = new Set()
 
     /** @type {'stopped'|'starting'|'unconfigured'|'locked'|'running'|'paused'|'stopping'|'error'} */
     this.status = 'stopped'
@@ -113,15 +116,29 @@ export class Gateway {
    *
    * @returns {Promise<void>} resolves once polling started or the channel disabled itself.
    */
-  async start() {
-    if (this.status !== 'stopped' && this.status !== 'error' && this.status !== 'locked') return
+  start() {
+    if (this.startPromise) return this.startPromise
+    if (this.status === 'error') return this.stop().then(() => this.start())
+    if (this.status !== 'stopped' && this.status !== 'locked') return Promise.resolve()
+    const starting = this.#start()
+    this.startPromise = starting
+    const clear = () => {
+      if (this.startPromise === starting) this.startPromise = undefined
+    }
+    starting.then(clear, clear)
+    return starting
+  }
+
+  async #start() {
     const retrying = this.status === 'locked'
     this.#clearLockRetry()
     this.status = 'starting'
     this.startedAt = Date.now()
+    this.abort = new AbortController()
+    const signal = this.abort.signal
 
     try {
-      const account = await this.accounts.latest()
+      const account = await raceAbort(this.accounts.latest(), signal)
       if (account === null) {
         this.status = 'unconfigured'
         this.logger.warn(
@@ -138,6 +155,7 @@ export class Gateway {
           { logger: this.logger },
         )
       } catch (error) {
+        if (signal.aborted) throw error
         if (error?.code === 'locked') {
           // One bot token may have exactly one poller. Refuse instead of racing
           // the running instance into a `-14` pause, but keep checking: the
@@ -157,6 +175,7 @@ export class Gateway {
         throw error
       }
 
+      signal.throwIfAborted()
       this.state = new ChannelState({
         stateDir: this.config.stateDir,
         botId: account.botId,
@@ -166,6 +185,7 @@ export class Gateway {
 
       this.allowed = new AllowList({ stateDir: this.config.stateDir })
       await this.allowed.load()
+      signal.throwIfAborted()
 
       this.client = this.clientFactory({
         baseUrl: account.baseUrl ?? this.config.baseUrl,
@@ -198,7 +218,6 @@ export class Gateway {
         logger: this.logger,
       })
 
-      this.abort = new AbortController()
       this.status = 'running'
       this.logger.info('gateway started', {
         botId: account.botId,
@@ -210,9 +229,10 @@ export class Gateway {
       this.#notifyLifecycle('notifyStart')
       this.pollPromise = this.#pollLoop()
     } catch (error) {
-      this.status = 'error'
       await this.lock?.release().catch(() => {})
       this.lock = undefined
+      if (signal.aborted) return
+      this.status = 'error'
       throw error
     }
   }
@@ -222,19 +242,42 @@ export class Gateway {
    *
    * @returns {Promise<void>} resolves once shutdown finished.
    */
-  async stop() {
-    if (this.status === 'stopped') return
+  stop() {
+    if (this.stopPromise) return this.stopPromise
+    if (this.status === 'stopped') return Promise.resolve()
+    const stopping = this.#stop()
+    this.stopPromise = stopping
+    const clear = () => {
+      if (this.stopPromise === stopping) this.stopPromise = undefined
+    }
+    stopping.then(clear, clear)
+    return stopping
+  }
+
+  async #stop() {
     this.#clearLockRetry()
     const wasRunning = this.status === 'running' || this.status === 'paused'
     this.status = 'stopping'
     this.abort?.abort()
-    await this.pollPromise?.catch(() => {})
-    this.pollPromise = undefined
-
+    for (const active of this.active.values()) {
+      active.controller.abort()
+      if (active.phase !== 'preparing') {
+        try {
+          this.host.cancel({ sessionId: active.sessionId })
+        } catch (error) {
+          this.logger.error('could not cancel a turn during shutdown', error)
+        }
+      }
+    }
     for (const queue of this.queues.values()) queue.length = 0
     this.queues.clear()
+    await this.startPromise?.catch(() => {})
+    await this.pollPromise?.catch(() => {})
+    this.pollPromise = undefined
+    await Promise.allSettled([...this.drainPromises])
     this.collector?.dispose()
     this.active.clear()
+    this.suppressAbort.clear()
 
     if (wasRunning) await this.#notifyLifecycle('notifyStop')
     await this.state?.flush().catch((error) => {
@@ -330,7 +373,15 @@ export class Gateway {
     if (active === undefined) return 'Nothing is running.'
     this.suppressAbort.add(userId)
     try {
-      this.host.cancel({ sessionId: active.sessionId })
+      if (active.phase !== 'preparing') this.host.cancel({ sessionId: active.sessionId })
+      active.controller.abort()
+      if (active.keepActive) {
+        active.keepActive = false
+        if (!this.draining.has(userId)) {
+          this.active.delete(userId)
+          this.suppressAbort.delete(userId)
+        }
+      }
       this.logger.info('cancellation requested', { userId, sessionId: active.sessionId })
     } catch (error) {
       this.suppressAbort.delete(userId)
@@ -388,21 +439,36 @@ export class Gateway {
         if (typeof batch.longPollingTimeoutMs === 'number' && batch.longPollingTimeoutMs > 0) {
           this.pollTimeoutMs = batch.longPollingTimeoutMs
         }
-        if (batch.getUpdatesBuf !== undefined) {
-          await this.state.setCursor(batch.getUpdatesBuf).catch((error) => {
-            this.logger.error('failed to persist the poll cursor', error)
-          })
-        }
         await this.lock.touch()
 
         for (const raw of batch.msgs) {
           if (this.abort.signal.aborted) break
-          await this.#accept(raw)
+          try {
+            await this.#accept(raw)
+          } catch (error) {
+            if (this.abort.signal.aborted) break
+            this.logger.error('failed to handle an inbound message', error)
+            const message = normalizeInbound(raw)
+            if (message) await this.#sendText(message.fromUserId, `Could not process this message: ${shorten(error.message)}`)
+          }
+        }
+        if (!this.abort.signal.aborted && batch.getUpdatesBuf !== undefined) {
+          await this.state.setCursor(batch.getUpdatesBuf)
         }
       } catch (error) {
         if (this.abort.signal.aborted || error.code === 'aborted') break
+        if (error.code === 'locked') {
+          this.logger.error('poller lock ownership was lost; stopping polling', error)
+          this.status = 'error'
+          this.abort.abort()
+          break
+        }
         if (error.code === 'session-paused') {
-          await this.#pauseForSession()
+          await this.#pauseForSession().catch((pauseError) => {
+            this.logger.error('could not maintain the poller lock during the pause', pauseError)
+            this.status = 'error'
+            this.abort.abort()
+          })
           continue
         }
         this.logger.error('getUpdates failed; backing off', error)
@@ -515,7 +581,15 @@ export class Gateway {
     }
     queue.push(message)
     this.queues.set(userId, queue)
-    void this.#drain(userId)
+    const draining = this.#drain(userId)
+    this.drainPromises.add(draining)
+    draining.then(
+      () => this.drainPromises.delete(draining),
+      (error) => {
+        this.drainPromises.delete(draining)
+        this.logger.error('sender queue failed', error)
+      },
+    )
   }
 
   /**
@@ -527,8 +601,10 @@ export class Gateway {
   async #drain(userId) {
     if (this.draining.has(userId)) return
     this.draining.add(userId)
+    const signal = this.abort.signal
     try {
-      while (this.status !== 'stopping' && this.status !== 'stopped') {
+      while ((this.status === 'running' || this.status === 'paused') && !signal.aborted) {
+        if (this.active.has(userId)) break
         const queue = this.queues.get(userId)
         if (queue === undefined || queue.length === 0) break
         const message = queue.shift()
@@ -548,43 +624,66 @@ export class Gateway {
    * @returns {Promise<void>} resolves after the reply attempt.
    */
   async #runTurn(userId, message) {
-    let sessionId
+    const controller = new AbortController()
+    const signal = AbortSignal.any([this.abort.signal, controller.signal])
+    const active = { controller, phase: 'preparing', requestId: randomUUID(), startedAt: Date.now() }
+    this.active.set(userId, active)
+    const onAbort = () => {
+      if (active.phase === 'admitting') active.cancelDuringAdmission = true
+    }
+    signal.addEventListener('abort', onAbort, { once: true })
+    let turn
+    let admission
     try {
       const mapping = await this.router.sessionFor(userId)
-      sessionId = mapping.sessionId
-    } catch (error) {
-      this.logger.error('could not resolve a session', error)
-      await this.#sendText(userId, `Could not open a DSH session: ${shorten(error.message)}`)
-      return
-    }
+      active.sessionId = mapping.sessionId
+      if (signal.aborted) return
+      turn = this.collector.begin({ sessionId: active.sessionId, requestId: active.requestId, signal })
+      turn.promise.catch(() => {})
+      await Promise.race([this.#typing(userId, true, signal), turn.promise])
+      if (signal.aborted) return
 
-    const requestId = randomUUID()
-    const turn = this.collector.begin({
-      sessionId,
-      requestId,
-      signal: this.abort.signal,
-    })
-    // A prompt failure may leave the wait unobserved; keep the rejection handled.
-    turn.promise.catch(() => {})
-    this.active.set(userId, { sessionId, requestId, startedAt: Date.now() })
-
-    try {
-      await this.#typing(userId, true)
-      await this.host.prompt({
-        sessionId,
-        requestId,
+      active.phase = 'admitting'
+      admission = this.host.prompt({
+        sessionId: active.sessionId,
+        requestId: active.requestId,
         text: message.text,
-        signal: this.abort.signal,
+        signal,
+      }).then((result) => {
+        active.phase = 'running'
+        return result
       })
+      await Promise.race([admission, turn.promise.then(() => undefined)])
       const result = await turn.promise
       await this.#replyToTurn(userId, result)
     } catch (error) {
-      // Admission failed: stop waiting for a turn that will never arrive.
-      turn.cancel('prompt-failed')
+      turn?.cancel('prompt-failed')
       await this.#handleTurnError(userId, error)
     } finally {
-      this.active.delete(userId)
-      await this.#typing(userId, false)
+      if (signal.aborted && this.status === 'error' && active.phase === 'running' && !active.cancelDuringAdmission) {
+        try {
+          this.host.cancel({ sessionId: active.sessionId })
+        } catch (error) {
+          active.keepActive = true
+          this.logger.error('could not cancel a turn after ownership loss', error)
+        }
+      }
+      if (admission && (active.phase === 'admitting' || active.cancelDuringAdmission)) {
+        // Session-wide cancellation must finish before another prompt is admitted.
+        await admission.then(() => {
+          if (!signal.aborted) return
+          try {
+            this.host.cancel({ sessionId: active.sessionId })
+          } catch (error) {
+            active.keepActive = true
+            this.logger.error('could not cancel a late prompt admission', error)
+          }
+        }, () => {})
+      }
+      signal.removeEventListener('abort', onAbort)
+      if (!active.keepActive) this.active.delete(userId)
+      this.suppressAbort.delete(userId)
+      await this.#typing(userId, false, signal)
     }
   }
 
@@ -650,10 +749,22 @@ export class Gateway {
     const code = error?.code
 
     if (code === 'turn-timeout') {
-      await this.#sendText(
-        userId,
-        'Timed out waiting for the agent. Send /stop to cancel, or send the message again.',
-      )
+      const active = this.active.get(userId)
+      if (active.phase === 'preparing') {
+        active.controller.abort()
+        await this.#sendText(userId, 'Timed out preparing the agent request. No prompt was submitted; please retry.')
+        return
+      }
+      try {
+        this.host.cancel({ sessionId: active.sessionId })
+        active.controller.abort()
+      } catch (cancelError) {
+        active.keepActive = true
+        this.logger.error('could not cancel a timed-out turn', cancelError)
+        await this.#sendText(userId, 'Timed out waiting for the agent. Cancellation failed; send /stop to try again.')
+        return
+      }
+      await this.#sendText(userId, 'Timed out waiting for the agent. Cancellation was requested; please retry when it has stopped.')
       return
     }
     if (code === 'session/not-found') {
@@ -741,25 +852,26 @@ export class Gateway {
    * @param {boolean} on - true to start, false to stop.
    * @returns {Promise<void>} resolves even when typing is unavailable.
    */
-  async #typing(userId, on) {
+  async #typing(userId, on, signal = this.abort?.signal) {
     try {
       let cached = this.typingTickets.get(userId)
-      if (cached === undefined || Date.now() - cached.at > 10 * 60 * 1000) {
-        const config = await this.client.getConfig({
+      if (!on && cached === undefined) return
+      if (on && (cached === undefined || Date.now() - cached.at > 10 * 60 * 1000)) {
+        const config = await raceAbort(this.client.getConfig({
           userId,
           contextToken: this.state.contextTokenFor(userId),
-          signal: this.abort?.signal,
-        })
+          signal,
+        }), signal)
         if (typeof config.typingTicket !== 'string' || config.typingTicket.length === 0) return
         cached = { ticket: config.typingTicket, at: Date.now() }
         this.typingTickets.set(userId, cached)
       }
-      await this.client.sendTyping({
+      await raceAbort(this.client.sendTyping({
         userId,
         typingTicket: cached.ticket,
         status: on ? TYPING_START : TYPING_STOP,
-        signal: this.abort?.signal,
-      })
+        signal,
+      }), signal)
     } catch (error) {
       if (error.code !== 'aborted') {
         this.logger.debug('typing indicator unavailable', { reason: error.message })

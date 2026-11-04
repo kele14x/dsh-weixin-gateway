@@ -1,12 +1,13 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdir, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import { Gateway } from '../src/runtime.mjs'
 import { AccountStore } from '../src/store/accounts.mjs'
 import { AllowList } from '../src/store/allowed.mjs'
 import { ChannelState } from '../src/store/state.mjs'
+import { acquireLock, LockError } from '../src/store/lock.mjs'
 import { createLogger } from '../src/util/log.mjs'
 import { FakeClient } from './helpers/fake-client.mjs'
 import { FakeHost } from './helpers/fake-host.mjs'
@@ -328,6 +329,330 @@ test('a -14 pause keeps the poller lock warm', async (t) => {
   await waitFor(() => gateway.status === 'running', { message: 'resumed' })
   assert.ok(touches >= 5, `expected repeated lock heartbeats during the pause, saw ${touches}`)
 })
+
+test('a failed command does not skip later messages in its batch', async (t) => {
+  const { client, host, gateway } = await setup(t, {
+    msgs: [textMessage({ id: 1, text: '/new' }), textMessage({ id: 2, text: 'hello' })],
+  })
+  const create = host.createSession.bind(host)
+  let attempts = 0
+  host.createSession = async (options) => {
+    if (attempts++ === 0) throw new Error('creation failed')
+    return create(options)
+  }
+  await gateway.start()
+  await waitFor(() => client.sent.length === 2 && gateway.state.cursor === 'cursor-1')
+  assert.match(client.sent[0].text, /Could not process this message: creation failed/)
+  assert.equal(client.sent[1].text, 'echo:hello')
+  assert.equal(host.callsOf('prompt').length, 1)
+})
+
+test('a batch cursor is not saved while a command is still pending', async (t) => {
+  const { dir, client, host, gateway } = await setup(t)
+  const creation = Promise.withResolvers()
+  t.after(() => creation.resolve('delayed-session'))
+  host.createSession = () => creation.promise
+  await gateway.start()
+  await gateway.state.setCursor('before')
+  client.push({ msgs: [textMessage({ text: '/new' })], getUpdatesBuf: 'after' })
+  await waitFor(() => gateway.router.inflight.size === 1)
+  assert.equal(gateway.state.cursor, 'before')
+  assert.equal(JSON.parse(await readFile(join(dir, 'state', 'bot1.json'), 'utf8')).cursor, 'before')
+  creation.resolve('delayed-session')
+  await waitFor(() => gateway.state.cursor === 'after')
+})
+
+test('shutdown leaves a partially handled batch cursor unchanged', async (t) => {
+  const { client, host, gateway } = await setup(t)
+  const creation = Promise.withResolvers()
+  t.after(() => creation.resolve('delayed-session'))
+  host.createSession = () => creation.promise
+  await gateway.start()
+  await gateway.state.setCursor('before')
+  client.push({
+    msgs: [textMessage({ id: 1, text: '/new' }), textMessage({ id: 2, text: 'must not run' })],
+    getUpdatesBuf: 'after',
+  })
+  await waitFor(() => gateway.router.inflight.size === 1)
+  const stopping = gateway.stop()
+  creation.resolve('delayed-session')
+  await stopping
+  assert.equal(gateway.state.cursor, 'before')
+  assert.equal(host.callsOf('prompt').length, 0)
+})
+
+test('a timed-out turn requests Host cancellation and reports it accurately', async (t) => {
+  const { client, host, gateway } = await setup(t, {
+    msgs: [textMessage()],
+    config: { turnTimeoutMs: 30 },
+    hostOptions: { autoRespond: false },
+  })
+  await gateway.start()
+  await waitFor(() => client.sent.length === 1)
+  assert.equal(host.callsOf('cancel').length, 1)
+  assert.match(client.sent[0].text, /Cancellation was requested/)
+  assert.doesNotMatch(client.sent[0].text, /send \/stop/)
+  assert.equal(await gateway.waitForQuiet(), true)
+})
+
+test('a failed timeout cancellation retains the handle for a later stop', async (t) => {
+  const { client, host, gateway } = await setup(t, {
+    msgs: [textMessage()],
+    config: { turnTimeoutMs: 30 },
+    hostOptions: { autoRespond: false },
+  })
+  const cancel = host.cancel.bind(host)
+  let attempts = 0
+  host.cancel = (options) => {
+    if (attempts++ === 0) throw new Error('cancel failed')
+    cancel(options)
+  }
+  await gateway.start()
+  await waitFor(() => client.sent.length === 1)
+  assert.match(client.sent[0].text, /Cancellation failed; send \/stop/)
+  assert.equal(gateway.active.size, 1)
+  client.push({ msgs: [textMessage({ id: 2, text: 'queued' })] })
+  await waitFor(() => gateway.queues.has('u1'))
+  assert.equal(host.callsOf('prompt').length, 1)
+  assert.match(gateway.stopTurn('u1'), /Stopping/)
+  assert.equal(host.callsOf('cancel').length, 1)
+  assert.equal(gateway.active.size, 0)
+  assert.equal(gateway.queues.size, 0)
+})
+
+for (const stage of ['getConfig', 'sendTyping', 'createSession']) {
+  test(`/stop during ${stage} prevents later prompt admission`, async (t) => {
+    const { client, host, gateway } = await setup(t)
+    const pending = Promise.withResolvers()
+    t.after(() => pending.resolve(stage === 'getConfig' ? { typingTicket: 'ticket' } : 'delayed-session'))
+    let entered = false
+    const target = stage === 'createSession' ? host : client
+    target[stage] = () => {
+      entered = true
+      return pending.promise
+    }
+    await gateway.start()
+    client.push({ msgs: [textMessage()] })
+    await waitFor(() => entered)
+    assert.match(gateway.stopTurn('u1'), /Stopping/)
+    pending.resolve(stage === 'getConfig' ? { typingTicket: 'ticket' } : 'delayed-session')
+    assert.equal(await gateway.waitForQuiet(), true)
+    assert.equal(host.callsOf('prompt').length, 0)
+    assert.equal(host.callsOf('cancel').length, 0)
+  })
+}
+
+test('a cancelled pending admission cannot cancel a later prompt in the same session', async (t) => {
+  const { client, host, gateway } = await setup(t)
+  const admission = Promise.withResolvers()
+  t.after(() => admission.resolve())
+  const prompt = host.prompt.bind(host)
+  let attempts = 0
+  host.prompt = async (options) => {
+    if (attempts++ === 0) {
+      host.calls.push({ type: 'prompt', ...options })
+      await admission.promise
+      return
+    }
+    return prompt(options)
+  }
+  await gateway.start()
+  client.push({ msgs: [textMessage()] })
+  await waitFor(() => host.callsOf('prompt').length === 1)
+  assert.match(gateway.stopTurn('u1'), /Stopping/)
+  client.push({ msgs: [textMessage({ id: 2, text: 'later', context: 'ctx-2' })] })
+  await waitFor(() => gateway.state.contextTokenFor('u1') === 'ctx-2')
+  await delay(20)
+  assert.equal(host.callsOf('prompt').length, 1, 'new admission must wait for the cancelled admission to settle')
+  admission.resolve()
+  await waitFor(() => host.callsOf('prompt').length === 2)
+  assert.equal(await gateway.waitForQuiet(), true)
+  assert.equal(host.callsOf('cancel').length, 2)
+  assert.equal(client.sent.at(-1).text, 'echo:later')
+})
+
+test('a failed late-admission cancellation keeps a usable stop handle', async (t) => {
+  const { client, host, gateway } = await setup(t)
+  const admission = Promise.withResolvers()
+  t.after(() => admission.resolve())
+  host.prompt = async (options) => {
+    host.calls.push({ type: 'prompt', ...options })
+    await admission.promise
+  }
+  const cancel = host.cancel.bind(host)
+  let attempts = 0
+  host.cancel = (options) => {
+    if (++attempts === 2) throw new Error('late cancellation failed')
+    cancel(options)
+  }
+  await gateway.start()
+  client.push({ msgs: [textMessage()] })
+  await waitFor(() => host.callsOf('prompt').length === 1)
+  assert.match(gateway.stopTurn('u1'), /Stopping/)
+  admission.resolve()
+  await waitFor(() => gateway.draining.size === 0)
+  assert.equal(gateway.active.get('u1')?.keepActive, true)
+  assert.match(gateway.stopTurn('u1'), /Stopping/)
+  assert.equal(gateway.active.size, 0)
+  assert.equal(attempts, 3)
+})
+
+test('completed output cannot bypass an unresolved admission', async (t) => {
+  const { client, host, gateway } = await setup(t)
+  const admission = Promise.withResolvers()
+  t.after(() => admission.resolve())
+  const prompt = host.prompt.bind(host)
+  let attempts = 0
+  host.prompt = async (options) => {
+    await prompt(options)
+    if (attempts++ === 0) await admission.promise
+  }
+  await gateway.start()
+  client.push({ msgs: [textMessage()] })
+  await waitFor(() => client.sent.length === 1)
+  client.push({ msgs: [textMessage({ id: 2, text: 'later' })] })
+  await waitFor(() => gateway.queues.has('u1'))
+  assert.equal(host.callsOf('prompt').length, 1)
+  admission.resolve()
+  await waitFor(() => client.sent.length === 2)
+  assert.equal(await gateway.waitForQuiet(), true)
+  assert.equal(host.callsOf('cancel').length, 0)
+})
+
+for (const stage of ['getConfig', 'sendTyping']) {
+  test(`turn timeout covers a pending ${stage} request before admission`, async (t) => {
+    const { client, host, gateway } = await setup(t, { config: { turnTimeoutMs: 30 } })
+    const typing = Promise.withResolvers()
+    t.after(() => typing.resolve({ typingTicket: 'ticket' }))
+    client[stage] = () => typing.promise
+    await gateway.start()
+    client.push({ msgs: [textMessage()] })
+    await waitFor(() => client.sent.length === 1)
+    assert.match(client.sent[0].text, /No prompt was submitted/)
+    assert.equal(await gateway.waitForQuiet(), true)
+    typing.resolve({ typingTicket: 'ticket' })
+    await delay(20)
+    assert.equal(host.callsOf('prompt').length, 0)
+    assert.equal(host.callsOf('cancel').length, 0)
+  })
+}
+
+for (const occupied of [false, true]) {
+  test(`restart after ownership loss tears down the old generation before ${occupied ? 'lock refusal' : 'reacquisition'}`, async (t) => {
+    const { config, client, host, gateway } = await setup(t)
+    const admission = Promise.withResolvers()
+    t.after(() => admission.resolve())
+    host.prompt = async (options) => {
+      host.calls.push({ type: 'prompt', ...options })
+      await admission.promise
+    }
+    await gateway.start()
+    client.push({ msgs: [textMessage()] })
+    await waitFor(() => host.callsOf('prompt').length === 1)
+    client.push({ msgs: [textMessage({ id: 2, text: 'old queue' })] })
+    await waitFor(() => gateway.queues.has('u1'))
+    if (occupied) {
+      const { hostname } = await import('node:os')
+      await writeFile(join(config.stateDir, 'lock', 'bot1.lock'), JSON.stringify({
+        token: 'replacement', pid: process.pid, host: hostname(), heartbeat: Date.now(),
+      }))
+    } else {
+      gateway.lock.touch = async () => { throw new LockError('ownership lost') }
+    }
+    client.push({ msgs: [] })
+    await waitFor(() => gateway.status === 'error')
+    const restarting = gateway.start()
+    assert.equal(gateway.status, 'stopping')
+    assert.equal(host.callsOf('prompt').length, 1)
+    admission.resolve()
+    await restarting
+    assert.equal(gateway.status, occupied ? 'locked' : 'running')
+    assert.equal(gateway.queues.size, 0)
+    assert.equal(gateway.active.size, 0)
+    assert.equal(host.listeners.size, occupied ? 0 : 1)
+    await delay(20)
+    assert.equal(host.callsOf('prompt').length, 1)
+  })
+}
+
+test('shutdown cancels Host execution and disposes observers', async (t) => {
+  const { host, gateway } = await setup(t, { msgs: [textMessage()], hostOptions: { autoRespond: false } })
+  await gateway.start()
+  await waitFor(() => host.callsOf('prompt').length === 1)
+  await gateway.stop()
+  assert.equal(host.callsOf('cancel').length, 1)
+  assert.equal(host.listeners.size, 0)
+  assert.equal(gateway.active.size, 0)
+  assert.equal(gateway.drainPromises.size, 0)
+  assert.equal(gateway.lock, undefined)
+})
+
+test('shutdown waits for session persistence before releasing ownership', async (t) => {
+  const { config, client, host, gateway } = await setup(t)
+  const creation = Promise.withResolvers()
+  t.after(() => creation.resolve('delayed-session'))
+  host.createSession = () => creation.promise
+  await gateway.start()
+  client.push({ msgs: [textMessage()] })
+  await waitFor(() => gateway.router.inflight.size === 1)
+  const stopping = gateway.stop()
+  await assert.rejects(() => acquireLock(join(config.stateDir, 'lock', 'bot1.lock')), LockError)
+  creation.resolve('delayed-session')
+  await stopping
+  assert.equal(host.callsOf('prompt').length, 0)
+  assert.equal(gateway.state.sessionFor('u1').sessionId, 'delayed-session')
+  const nextOwner = await acquireLock(join(config.stateDir, 'lock', 'bot1.lock'))
+  await nextOwner.release()
+})
+
+test('an in-flight lock retry cannot restart polling after shutdown', async (t) => {
+  const { config, accounts, client, gateway } = await setup(t, { gatewayOptions: { lockRetryMs: 10 } })
+  const owner = await acquireLock(join(config.stateDir, 'lock', 'bot1.lock'))
+  t.after(() => owner.release())
+  const account = await accounts.latest()
+  await gateway.start()
+  assert.equal(gateway.status, 'locked')
+  const lookup = Promise.withResolvers()
+  t.after(() => lookup.resolve(account))
+  accounts.latest = () => lookup.promise
+  await waitFor(() => gateway.status === 'starting')
+  await gateway.stop()
+  await owner.release()
+  lookup.resolve(account)
+  await delay(30)
+  assert.equal(gateway.status, 'stopped')
+  assert.equal(gateway.lock, undefined)
+  assert.deepEqual(client.notifications, [])
+})
+
+test('immediate shutdown during startup cannot publish a running gateway', async (t) => {
+  const { client, gateway } = await setup(t)
+  const starting = gateway.start()
+  const stopping = gateway.stop()
+  await Promise.all([starting, stopping])
+  assert.equal(gateway.status, 'stopped')
+  assert.equal(gateway.lock, undefined)
+  assert.deepEqual(client.notifications, [])
+})
+
+for (const paused of [false, true]) {
+  test(`ownership loss stops ${paused ? 'paused' : 'running'} polling`, async (t) => {
+    const { config, client, gateway } = await setup(t, {
+      config: { sessionPauseMs: 200 },
+      gatewayOptions: { pauseHeartbeatMs: 10 },
+    })
+    await gateway.start()
+    const path = join(config.stateDir, 'lock', 'bot1.lock')
+    const { hostname } = await import('node:os')
+    await writeFile(path, JSON.stringify({ token: 'replacement', pid: process.pid, host: hostname(), heartbeat: Date.now() }))
+    if (paused) client.pausedOnce = 'pending'
+    client.push({ msgs: [] })
+    await waitFor(() => gateway.status === 'error')
+    assert.equal(gateway.abort.signal.aborted, true)
+    await gateway.stop()
+    assert.equal(JSON.parse(await readFile(path, 'utf8')).token, 'replacement')
+  })
+}
 
 test('a corrupt state file fails startup instead of dropping session mappings', async (t) => {
   const { config, gateway } = await setup(t)

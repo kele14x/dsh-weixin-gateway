@@ -151,7 +151,10 @@ export class CommandRouter {
       return 'That pairing code is not valid.'
     }
 
-    await this.allowed.allow(userId)
+    if (!(await this.allowed.redeem(userId, candidate))) {
+      if (this.allowed.isAllowed(userId)) return 'This chat is already paired.'
+      return `That pairing code has already been redeemed. Ask the operator to set a different code in ${envName} and share the new code.`
+    }
     this.bindFailures.delete(userId)
     this.logger.info('paired a WeChat sender', { userId })
     return 'Paired. Send a message to talk to the agent, or /help for commands.'

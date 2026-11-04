@@ -14,7 +14,8 @@ import { join, resolve } from 'node:path'
 import { rm } from 'node:fs/promises'
 import { pathToFileURL } from 'node:url'
 import { createInterface } from 'node:readline/promises'
-import { AccountStore, maskToken } from '../src/store/accounts.mjs'
+import { AccountStore, maskToken, safeBotId } from '../src/store/accounts.mjs'
+import { acquireLock, LockError } from '../src/store/lock.mjs'
 import { ChannelState } from '../src/store/state.mjs'
 import { AllowList } from '../src/store/allowed.mjs'
 import { ILinkClient } from '../src/ilink/client.mjs'
@@ -48,11 +49,14 @@ export function parseArgs(argv) {
     const argument = rest[index]
     switch (argument) {
       case '--state-dir':
-        options.stateDir = rest[++index]
+      case '--base-url': {
+        const value = rest[++index]
+        if (typeof value !== 'string' || value.trim().length === 0 || value.trim().startsWith('-')) {
+          throw new Error(`${argument} requires a nonempty value (not an option)`)
+        }
+        options[argument === '--state-dir' ? 'stateDir' : 'baseUrl'] = value
         break
-      case '--base-url':
-        options.baseUrl = rest[++index]
-        break
+      }
       case '--force':
         options.force = true
         break
@@ -110,6 +114,13 @@ async function renderQr({ qrcode, qrcodeImgContent }) {
   }
 }
 
+export function createLoginIo(readline) {
+  return {
+    print: (line) => console.log(line),
+    prompt: async (question, { signal } = {}) => (await readline.question(question, { signal })).trim(),
+  }
+}
+
 /**
  * `dsh-weixin login`.
  *
@@ -133,10 +144,7 @@ async function login(options, accounts) {
   })
 
   const readline = createInterface({ input: process.stdin, output: process.stdout })
-  const io = {
-    print: (line) => console.log(line),
-    prompt: async (question) => (await readline.question(question)).trim(),
-  }
+  const io = createLoginIo(readline)
 
   try {
     const credentials = await runQrLogin({
@@ -227,7 +235,7 @@ async function status(options, stateDir, accounts) {
     await allowed.load()
     console.log(`  paired:   ${allowed.size} sender(s)`)
 
-    const lockPath = join(stateDir, 'lock', `${record.botId}.lock`)
+    const lockPath = join(stateDir, 'lock', `${safeBotId(record.botId)}.lock`)
     console.log(`  lock:     ${existsSync(lockPath) ? 'held' : 'free'}`)
     console.log('')
   }
@@ -259,15 +267,27 @@ async function logout(options, stateDir, accounts) {
     }
   }
 
-  await accounts.remove(record.botId)
-  const state = new ChannelState({ stateDir, botId: record.botId })
-  await state.load().catch(() => {})
-  await rm(state.file, { force: true })
-  await rm(join(stateDir, 'allowed.json'), { force: true })
-  await rm(join(stateDir, 'lock', `${record.botId}.lock`), { force: true })
+  let lock
+  try {
+    lock = await acquireLock(join(stateDir, 'lock', `${safeBotId(record.botId)}.lock`))
+  } catch (error) {
+    if (!(error instanceof LockError)) throw error
+    console.error(`Logout refused: ${error.message}. Stop the owning gateway and retry logout.`)
+    return 1
+  }
 
-  console.log(`Removed ${record.botId}. The running gateway, if any, must be restarted.`)
-  return 0
+  try {
+    await accounts.remove(record.botId)
+    const state = new ChannelState({ stateDir, botId: record.botId })
+    await state.load().catch(() => {})
+    await rm(state.file, { force: true })
+    await rm(join(stateDir, 'allowed.json'), { force: true })
+
+    console.log(`Removed ${record.botId}.`)
+    return 0
+  } finally {
+    await lock.release()
+  }
 }
 
 /**

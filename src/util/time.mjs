@@ -54,6 +54,7 @@ export function raceAbort(promise, signal) {
   if (!signal) return promise
   return new Promise((resolve, reject) => {
     if (signal.aborted) {
+      promise.catch(() => {})
       reject(abortError())
       return
     }

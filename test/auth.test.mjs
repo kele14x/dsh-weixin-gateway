@@ -1,5 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { getEventListeners } from 'node:events'
 import { LoginError, runQrLogin } from '../src/ilink/auth.mjs'
 
 /**
@@ -166,4 +167,102 @@ test('a transient status-poll failure is treated as wait, not a failed login', a
     timeoutMs: 1000,
   })
   assert.equal(credentials.botId, 'bot')
+})
+
+test('unresolved verification input times out using only the remaining login budget', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const controller = new AbortController()
+  const client = authClient([{ status: 'wait' }, { status: 'need_verifycode' }])
+  let clock = 0
+  let inputSignal
+  let prompted
+  const started = new Promise((resolve) => { prompted = resolve })
+  const io = fakeIo()
+  io.prompt = (question, { signal }) => {
+    inputSignal = signal
+    prompted()
+    return new Promise(() => {})
+  }
+
+  const login = runQrLogin({
+    client,
+    io,
+    signal: controller.signal,
+    timeoutMs: 100,
+    pollIntervalMs: 70,
+    now: () => clock,
+    sleepFn: async (ms) => { clock += ms },
+  })
+  const failed = assert.rejects(login, (error) => error instanceof LoginError && error.code === 'timeout')
+  await started
+  t.mock.timers.tick(29)
+  assert.equal(inputSignal.aborted, false)
+  t.mock.timers.tick(1)
+  await failed
+  assert.equal(inputSignal.aborted, true)
+  assert.equal(getEventListeners(controller.signal, 'abort').length, 0)
+  assert.equal(client.calls.length, 2)
+})
+
+test('external abort cancels login even when verification input never settles', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const controller = new AbortController()
+  const client = authClient([{ status: 'need_verifycode' }])
+  let inputSignal
+  let prompted
+  const started = new Promise((resolve) => { prompted = resolve })
+  const io = fakeIo()
+  io.prompt = (question, { signal }) => {
+    inputSignal = signal
+    prompted()
+    return new Promise(() => {})
+  }
+
+  const login = runQrLogin({ client, io, signal: controller.signal, timeoutMs: 100 })
+  const failed = assert.rejects(login, (error) => error instanceof LoginError && error.code === 'aborted')
+  await started
+  controller.abort()
+  await failed
+  assert.equal(inputSignal.aborted, true)
+  assert.equal(getEventListeners(controller.signal, 'abort').length, 0)
+  t.mock.timers.tick(1000)
+  assert.equal(client.calls.length, 1)
+})
+
+test('successful verification clears its deadline and external abort listener', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const clearTimer = t.mock.method(globalThis, 'clearTimeout')
+  const controller = new AbortController()
+  const client = authClient([
+    { status: 'need_verifycode' },
+    { status: 'confirmed', bot_token: 't', ilink_bot_id: 'b' },
+  ])
+  const credentials = await runQrLogin({
+    client,
+    io: fakeIo(),
+    signal: controller.signal,
+    now: () => 0,
+    timeoutMs: 100,
+  })
+  assert.equal(credentials.botId, 'b')
+  assert.equal(getEventListeners(controller.signal, 'abort').length, 0)
+  assert.equal(clearTimer.mock.callCount(), 1)
+  t.mock.timers.tick(1000)
+})
+
+test('a failed verification prompt preserves its error and cleans up cancellation resources', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const clearTimer = t.mock.method(globalThis, 'clearTimeout')
+  const controller = new AbortController()
+  const client = authClient([{ status: 'need_verifycode' }])
+  const failure = new Error('input failed')
+  const io = fakeIo()
+  io.prompt = () => { throw failure }
+  await assert.rejects(
+    runQrLogin({ client, io, signal: controller.signal, now: () => 0, timeoutMs: 100 }),
+    (error) => error === failure,
+  )
+  assert.equal(getEventListeners(controller.signal, 'abort').length, 0)
+  assert.equal(clearTimer.mock.callCount(), 1)
+  t.mock.timers.tick(1000)
 })

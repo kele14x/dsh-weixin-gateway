@@ -37,12 +37,45 @@ export class LoginError extends Error {
   }
 }
 
+async function promptVerification(io, remaining, signal) {
+  if (signal?.aborted) throw new LoginError('aborted', 'login was cancelled')
+  if (remaining <= 0) throw new LoginError('timeout', 'QR login timed out; run login again')
+
+  const input = new AbortController()
+  let timer
+  let onAbort
+  try {
+    const cancelled = new Promise((_, reject) => {
+      const cancel = (code, message) => {
+        const error = new LoginError(code, message)
+        reject(error)
+        input.abort(error)
+      }
+      timer = setTimeout(() => cancel('timeout', 'QR login timed out; run login again'), remaining)
+      onAbort = () => cancel('aborted', 'login was cancelled')
+      signal?.addEventListener('abort', onAbort, { once: true })
+      if (signal?.aborted) onAbort()
+    })
+    return await Promise.race([
+      cancelled,
+      Promise.resolve().then(() => {
+        input.signal.throwIfAborted()
+        return io.prompt('Enter the verification code shown on your phone: ', { signal: input.signal })
+      }),
+    ])
+  } finally {
+    clearTimeout(timer)
+    signal?.removeEventListener('abort', onAbort)
+    input.abort()
+  }
+}
+
 /**
  * Run the QR login handshake until it yields credentials.
  *
  * @param {object} options - login options.
  * @param {import('./client.mjs').ILinkClient} options.client - unauthenticated client.
- * @param {{print: (line: string) => void, prompt: (question: string) => Promise<string>}} options.io - terminal adapter.
+ * @param {{print: (line: string) => void, prompt: (question: string, options: {signal: AbortSignal}) => Promise<string>}} options.io - terminal adapter.
  * @param {string[]} [options.localTokens] - recent tokens offered to the backend.
  * @param {number} [options.pollIntervalMs] - delay between status polls.
  * @param {number} [options.timeoutMs] - overall login budget.
@@ -134,7 +167,9 @@ export async function runQrLogin({
         if (verifyAttempts > maxVerifyAttempts) {
           throw new LoginError('verify-code-blocked', 'too many incorrect verification codes')
         }
-        const answer = await io.prompt('Enter the verification code shown on your phone: ')
+        const answer = await promptVerification(io, deadline - now(), signal)
+        if (signal?.aborted) throw new LoginError('aborted', 'login was cancelled')
+        if (now() >= deadline) throw new LoginError('timeout', 'QR login timed out; run login again')
         if (typeof answer !== 'string' || answer.trim().length === 0) {
           throw new LoginError('verify-code-required', 'a verification code is required to finish login')
         }
