@@ -1,10 +1,23 @@
+# Dependencies
 node_modules/
-.review-tmp/
+.pnpm-store/
+.npm-cache/
+
+# WeChat agent workspace: files the bot writes stay out of the repo
+/workspace/
+
+# Test and install scratch directories
+.tmp-*
+
+# Build and packaging output
+coverage/
+*.tgz
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+
+# Logs and OS metadata
 *.log
 .DS_Store
-data/
-.npm-cache/
-.tmp-test-*
-.tmp-home-*
-.tmp-*
-/workspace/
