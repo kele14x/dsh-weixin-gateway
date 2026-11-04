@@ -19,7 +19,10 @@ import { cleanup, makeTempDir, waitFor } from './helpers/tmp.mjs'
  * @param {object} [options] - setup options.
  * @returns {Promise<object>} fixture.
  */
-async function setup(t, { msgs = [], config = {}, hostOptions = {}, allowed = true, account = true } = {}) {
+async function setup(
+  t,
+  { msgs = [], config = {}, hostOptions = {}, allowed = true, account = true, gatewayOptions = {} } = {},
+) {
   const dir = await makeTempDir('gw')
   t.after(() => cleanup(dir))
 
@@ -60,6 +63,7 @@ async function setup(t, { msgs = [], config = {}, hostOptions = {}, allowed = tr
     logger: createLogger({ level: 'silent' }),
     accounts,
     clientFactory: () => client,
+    ...gatewayOptions,
   })
   t.after(async () => {
     await gateway.stop()
@@ -259,6 +263,34 @@ test('a second gateway on the same account refuses to poll', async (t) => {
   assert.equal(second.status, 'locked')
 })
 
+test('a locked gateway adopts the account once the first owner exits', async (t) => {
+  const { config, host } = await setup(t)
+  const first = new Gateway({
+    config,
+    host,
+    logger: createLogger({ level: 'silent' }),
+    clientFactory: () => new FakeClient(),
+  })
+  t.after(() => first.stop())
+  await first.start()
+  assert.equal(first.status, 'running')
+
+  const second = new Gateway({
+    config,
+    host,
+    logger: createLogger({ level: 'silent' }),
+    accounts: new AccountStore({ stateDir: config.stateDir }),
+    clientFactory: () => new FakeClient(),
+    lockRetryMs: 20,
+  })
+  t.after(() => second.stop())
+  await second.start()
+  assert.equal(second.status, 'locked')
+
+  await first.stop()
+  await waitFor(() => second.status === 'running', { message: 'the second gateway adopted the account' })
+})
+
 test('a missing credential disables the channel with a diagnostic', async (t) => {
   const { gateway } = await setup(t, { account: false })
   await gateway.start()
@@ -272,6 +304,29 @@ test('a -14 response pauses and then resumes polling', async (t) => {
 
   await waitFor(() => client.pausedOnce === 'done', { message: 'pause observed' })
   await waitFor(() => gateway.status === 'running', { message: 'resumed' })
+})
+
+test('a -14 pause keeps the poller lock warm', async (t) => {
+  const { client, gateway } = await setup(t, {
+    config: { sessionPauseMs: 200 },
+    gatewayOptions: { pauseHeartbeatMs: 10 },
+  })
+  await gateway.start()
+  await waitFor(() => gateway.status === 'running', { message: 'running' })
+
+  let touches = 0
+  const realTouch = gateway.lock.touch.bind(gateway.lock)
+  gateway.lock.touch = async () => {
+    touches += 1
+    return realTouch()
+  }
+
+  client.pausedOnce = 'pending'
+  client.push({ msgs: [] })
+
+  await waitFor(() => client.pausedOnce === 'done', { message: 'pause observed' })
+  await waitFor(() => gateway.status === 'running', { message: 'resumed' })
+  assert.ok(touches >= 5, `expected repeated lock heartbeats during the pause, saw ${touches}`)
 })
 
 test('a corrupt state file fails startup instead of dropping session mappings', async (t) => {

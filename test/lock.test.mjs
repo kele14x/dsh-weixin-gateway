@@ -2,7 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { hostname } from 'node:os'
 import { join } from 'node:path'
-import { readFile, writeFile } from 'node:fs/promises'
+import { readdir, readFile, writeFile } from 'node:fs/promises'
 import { acquireLock, LockError, isProcessAlive } from '../src/store/lock.mjs'
 import { makeTempDir, cleanup } from './helpers/tmp.mjs'
 
@@ -51,6 +51,26 @@ test('a recent lock from another host is refused', async (t) => {
     }),
   )
   await assert.rejects(() => acquireLock(path, { staleMs: 60_000 }), LockError)
+})
+
+test('concurrent takeovers of a stale lock leave exactly one owner', async (t) => {
+  const dir = await makeTempDir('lock')
+  t.after(() => cleanup(dir))
+  const path = join(dir, 'bot1.lock')
+
+  await writeFile(
+    path,
+    JSON.stringify({ version: 1, pid: 999_999, host: hostname(), token: 'old', startedAt: 1, heartbeat: 1 }),
+  )
+
+  const results = await Promise.allSettled([acquireLock(path), acquireLock(path)])
+  const owners = results.filter((result) => result.status === 'fulfilled')
+  assert.equal(owners.length, 1)
+  const loser = results.find((result) => result.status === 'rejected')
+  assert.ok(loser.reason instanceof LockError)
+  assert.deepEqual((await readdir(dir)).sort(), ['bot1.lock'])
+
+  await owners[0].value.release()
 })
 
 test('release only removes our own lock', async (t) => {

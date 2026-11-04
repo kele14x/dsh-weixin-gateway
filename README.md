@@ -20,7 +20,8 @@ outbound sends. There is no webhook, no callback, and nothing to expose.
   fresh session and keeps the old history.
 - Default-deny sender allowlist; pair a chat with a one-time `/bind` code.
 - Replies are chunked Unicode-safe under `maxMessageChars`.
-- Exactly one poller per bot token, enforced by a local lock.
+- Exactly one poller per bot token, enforced by a local lock. A second Host on
+  the same machine waits and takes over when the first exits.
 
 ## Requirements
 
@@ -128,7 +129,10 @@ Queue size, timeouts, and backoff are in `src/config.mjs`.
 ## Failure handling
 
 - `-14`: one poller per bot token. The gateway pauses for the documented hour and
-  logs a concrete diagnostic.
+  logs a concrete diagnostic; the lock heartbeat keeps running through the pause.
+- A second Host on the same machine (a manual `dsh web`, another unit) refuses to
+  poll, then retries every 30 s and adopts the account as soon as the first owner
+  exits. Taking over a stale lock is atomic, so two starters cannot both claim it.
 - Long-poll or network errors: backoff, cursor kept.
 - Send errors: one retry on a plain network failure, then log; never claims
   success.
@@ -141,7 +145,7 @@ Queue size, timeouts, and backoff are in `src/config.mjs`.
 npm test
 ```
 
-71 offline tests against a fake iLink client and fake Host — no WeChat account is
+76 offline tests against a fake iLink client and fake Host — no WeChat account is
 used.
 
 ## Docker

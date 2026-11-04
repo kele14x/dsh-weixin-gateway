@@ -5,6 +5,7 @@
  * and the reply path. Failure policy follows the design document:
  *
  * - a `-14` response pauses the account for one hour and then retries;
+ * - a poller lock held by another Host is retried until it is released;
  * - a network failure backs off with the cursor untouched;
  * - a turn that ends without text still produces a notice;
  * - nothing is ever reported as a successful answer when it was not.
@@ -52,8 +53,18 @@ export class Gateway {
    * @param {object} [options.logger] - logger.
    * @param {object} [options.accounts] - account store override.
    * @param {Function} [options.clientFactory] - client factory override for tests.
+   * @param {number} [options.lockRetryMs] - delay before retrying a poller lock held elsewhere.
+   * @param {number} [options.pauseHeartbeatMs] - lock heartbeat interval during a `-14` pause.
    */
-  constructor({ config, host, logger = silentLogger, accounts, clientFactory }) {
+  constructor({
+    config,
+    host,
+    logger = silentLogger,
+    accounts,
+    clientFactory,
+    lockRetryMs = 30_000,
+    pauseHeartbeatMs = 60_000,
+  }) {
     this.config = config
     this.host = host
     this.logger = logger
@@ -61,6 +72,9 @@ export class Gateway {
     this.clientFactory =
       clientFactory ??
       ((options) => new ILinkClient({ ...options, pollTimeoutMs: config.pollTimeoutMs }))
+    this.lockRetryMs = lockRetryMs
+    this.pauseHeartbeatMs = pauseHeartbeatMs
+    this.lockRetryTimer = undefined
 
     /** @type {'stopped'|'starting'|'unconfigured'|'locked'|'running'|'paused'|'stopping'|'error'} */
     this.status = 'stopped'
@@ -94,12 +108,15 @@ export class Gateway {
 
   /**
    * Start the channel. A missing credential disables the channel instead of
-   * failing the Host process; a lock conflict does the same with a diagnostic.
+   * failing the Host process; a lock conflict does the same with a diagnostic,
+   * then retries, so this Host adopts the account when the other owner exits.
    *
    * @returns {Promise<void>} resolves once polling started or the channel disabled itself.
    */
   async start() {
-    if (this.status !== 'stopped' && this.status !== 'error') return
+    if (this.status !== 'stopped' && this.status !== 'error' && this.status !== 'locked') return
+    const retrying = this.status === 'locked'
+    this.#clearLockRetry()
     this.status = 'starting'
     this.startedAt = Date.now()
 
@@ -122,13 +139,19 @@ export class Gateway {
         )
       } catch (error) {
         if (error?.code === 'locked') {
-          // One bot token may have exactly one poller; refuse instead of
-          // racing the running instance into a `-14` pause.
+          // One bot token may have exactly one poller. Refuse instead of racing
+          // the running instance into a `-14` pause, but keep checking: the
+          // other Host may be a manual run that exits shortly.
           this.status = 'locked'
-          this.logger.error(
-            'another gateway process owns this bot account; refusing to poll (single-poller rule)',
-            { holder: error.holder },
-          )
+          if (retrying) {
+            this.logger.debug('poller lock is still held elsewhere', { holder: error.holder })
+          } else {
+            this.logger.error(
+              'another gateway process owns this bot account; refusing to poll (single-poller rule)',
+              { holder: error.holder },
+            )
+          }
+          this.#scheduleLockRetry()
           return
         }
         throw error
@@ -201,6 +224,7 @@ export class Gateway {
    */
   async stop() {
     if (this.status === 'stopped') return
+    this.#clearLockRetry()
     const wasRunning = this.status === 'running' || this.status === 'paused'
     this.status = 'stopping'
     this.abort?.abort()
@@ -222,6 +246,33 @@ export class Gateway {
     this.lock = undefined
     this.status = 'stopped'
     this.logger.info('gateway stopped')
+  }
+
+  /**
+   * Poll the lock again after a conflict, so a Host that started second is not
+   * inert forever. The timer is unref'd: it never keeps the process alive, and
+   * `stop()` cancels it.
+   *
+   * @returns {void}
+   */
+  #scheduleLockRetry() {
+    if (this.lockRetryTimer !== undefined) return
+    const timer = setTimeout(() => {
+      this.lockRetryTimer = undefined
+      if (this.status !== 'locked') return
+      this.start().catch((error) => {
+        this.logger.error('poller lock retry failed', error)
+      })
+    }, this.lockRetryMs)
+    timer.unref?.()
+    this.lockRetryTimer = timer
+  }
+
+  /** Cancel a pending lock retry. */
+  #clearLockRetry() {
+    if (this.lockRetryTimer === undefined) return
+    clearTimeout(this.lockRetryTimer)
+    this.lockRetryTimer = undefined
   }
 
   /**
@@ -372,10 +423,19 @@ export class Gateway {
       'iLink paused this account session (-14): another poller may be running, or the login is stale; retrying after the pause window',
       { retryInMs: this.config.sessionPauseMs },
     )
-    try {
-      await sleep(this.config.sessionPauseMs, this.abort.signal)
-    } catch {
-      return
+    // The pause outlives the lock's stale window (120 s), so a silent hour-long
+    // sleep would let a second Host take the lock over — and both would then
+    // poll when this one resumes. Sleep in slices and keep the heartbeat warm.
+    const deadline = Date.now() + this.config.sessionPauseMs
+    while (this.status === 'paused' && Date.now() < deadline) {
+      const remaining = deadline - Date.now()
+      try {
+        await sleep(Math.min(this.pauseHeartbeatMs, remaining), this.abort.signal)
+      } catch {
+        return
+      }
+      if (this.status !== 'paused') return
+      await this.lock?.touch()
     }
     if (this.status === 'paused') {
       this.status = 'running'

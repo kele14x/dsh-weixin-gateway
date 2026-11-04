@@ -4,12 +4,14 @@
  * One bot token may have exactly one active long poller: the iLink session is
  * per account, and a second poller makes both fail with `-14`. The lock is a
  * local advisory file, so it protects one host (or one container) from a second
- * gateway process; it cannot coordinate replicas on different hosts.
+ * gateway process; it cannot coordinate replicas on different hosts. Creation
+ * is exclusive (`wx`), and a stale lock is moved aside with `rename` before it
+ * is replaced, so two contenders cannot both take over the same abandoned lock.
  *
  * @module dsh-weixin-gateway/store/lock
  */
 
-import { open, readFile, rm, writeFile } from 'node:fs/promises'
+import { link, open, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { dirname } from 'node:path'
 import { hostname } from 'node:os'
 import { randomBytes } from 'node:crypto'
@@ -18,6 +20,8 @@ import { silentLogger } from '../util/log.mjs'
 
 const DEFAULT_STALE_MS = 120_000
 const TOUCH_INTERVAL_MS = 15_000
+/** Bounded retries when a contender keeps losing a lock race. */
+const ACQUIRE_ATTEMPTS = 3
 
 /** Raised when another live process owns the bot's poller lock. */
 export class LockError extends Error {
@@ -81,6 +85,77 @@ function isStale(holder, { host, now, staleMs }) {
 }
 
 /**
+ * Create the lock file exclusively and write its record.
+ *
+ * @param {string} lockPath - lock file path.
+ * @param {object} record - lock document.
+ * @returns {Promise<boolean>} true when this process created the file.
+ */
+async function createLockFile(lockPath, record) {
+  let handle
+  try {
+    handle = await open(lockPath, 'wx', 0o600)
+  } catch (error) {
+    if (error.code === 'EEXIST') return false
+    throw error
+  }
+  try {
+    await handle.writeFile(JSON.stringify(record))
+  } catch (error) {
+    await handle.close().catch(() => {})
+    await rm(lockPath, { force: true }).catch(() => {})
+    throw error
+  }
+  await handle.close()
+  return true
+}
+
+/**
+ * Move a stale lock aside so exactly one contender can replace it.
+ *
+ * `rename` is atomic and requires its source to exist, so when two processes
+ * decide the same lock is abandoned, only one of them wins the move; the other
+ * sees `ENOENT` and retries from the top. The winner then re-reads the inode it
+ * actually moved, because the staleness decision was made from an earlier read:
+ * a lock that is live at this point is linked back rather than stolen.
+ *
+ * @param {string} lockPath - lock file path.
+ * @param {string} token - this contender's token.
+ * @param {{host: string, staleMs: number, logger: object}} context - staleness context.
+ * @returns {Promise<{outcome: 'claimed'|'gone'|'busy', holder: object|null}>} claim result.
+ */
+async function claimStaleLock(lockPath, token, { host, staleMs, logger }) {
+  const claimed = `${lockPath}.claim-${token}`
+  try {
+    await rename(lockPath, claimed)
+  } catch (error) {
+    if (error.code === 'ENOENT') return { outcome: 'gone', holder: null }
+    throw error
+  }
+
+  const holder = await readHolder(claimed)
+  if (holder !== null && !isStale(holder, { host, now: Date.now(), staleMs })) {
+    logger.warn('a poller lock moved aside as stale was live; restoring it', { pid: holder.pid })
+    try {
+      await link(claimed, lockPath)
+    } catch (error) {
+      if (error.code === 'EEXIST') {
+        // A newer owner published its own lock between our rename and this
+        // link; the displaced record cannot be restored without clobbering it.
+        logger.warn('a live poller lock was displaced while a newer lock appeared', { pid: holder.pid })
+      } else {
+        logger.warn('could not restore a live poller lock', { reason: error.message })
+      }
+    }
+    await rm(claimed, { force: true })
+    return { outcome: 'busy', holder }
+  }
+
+  await rm(claimed, { force: true })
+  return { outcome: 'claimed', holder }
+}
+
+/**
  * Acquire the poller lock or fail.
  *
  * @param {string} lockPath - lock file path.
@@ -101,32 +176,35 @@ export async function acquireLock(
   const token = randomBytes(8).toString('hex')
   const record = { version: 1, pid, host, token, startedAt: now, heartbeat: now }
 
-  try {
-    const handle = await open(lockPath, 'wx', 0o600)
-    try {
-      await handle.writeFile(JSON.stringify(record))
-    } finally {
-      await handle.close()
+  for (let attempt = 0; attempt < ACQUIRE_ATTEMPTS; attempt += 1) {
+    if (await createLockFile(lockPath, record)) return makeHandle(lockPath, record, logger)
+
+    const holder = await readHolder(lockPath)
+    if (holder !== null && !isStale(holder, { host, now: Date.now(), staleMs })) {
+      throw new LockError(
+        `another gateway owns bot poller ${lockPath} (pid ${holder.pid} on ${holder.host})`,
+        { pid: holder.pid, host: holder.host, startedAt: holder.startedAt },
+      )
     }
-    return makeHandle(lockPath, record, logger)
-  } catch (error) {
-    if (error.code !== 'EEXIST') throw error
+
+    const claim = await claimStaleLock(lockPath, token, { host, staleMs, logger })
+    if (claim.outcome === 'busy') {
+      throw new LockError(
+        `another gateway owns bot poller ${lockPath} (pid ${claim.holder.pid} on ${claim.holder.host})`,
+        { pid: claim.holder.pid, host: claim.holder.host, startedAt: claim.holder.startedAt },
+      )
+    }
+    if (claim.outcome === 'claimed') {
+      logger.warn('taking over a stale poller lock', {
+        previousPid: claim.holder?.pid,
+        previousHost: claim.holder?.host,
+      })
+    }
   }
 
-  const holder = await readHolder(lockPath)
-  if (holder !== null && !isStale(holder, { host, now, staleMs })) {
-    throw new LockError(
-      `another gateway owns bot poller ${lockPath} (pid ${holder.pid} on ${holder.host})`,
-      { pid: holder.pid, host: holder.host, startedAt: holder.startedAt },
-    )
-  }
-
-  logger.warn('taking over a stale poller lock', {
-    previousPid: holder?.pid,
-    previousHost: holder?.host,
-  })
-  await writeFile(lockPath, JSON.stringify(record), { mode: 0o600 })
-  return makeHandle(lockPath, record, logger)
+  throw new LockError(
+    `could not claim bot poller ${lockPath}: the lock kept changing (${ACQUIRE_ATTEMPTS} attempts)`,
+  )
 }
 
 /**
