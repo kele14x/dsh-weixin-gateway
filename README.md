@@ -221,10 +221,13 @@ npm test
 76 offline tests against a fake iLink client and fake Host — no WeChat account is
 used.
 
-## Docker
+## Example: Docker Host
 
-See [`docker/README.md`](docker/README.md). One replica per bot token; the WeChat
-side needs no published port.
+Container orchestration is outside this plugin's responsibilities. The optional
+[`examples/docker/`](examples/docker/README.md) reference shows how an operator
+might build and run the entire DSH Web Host with this plugin. It uses
+operator-owned bind directories and explicit profile registration instead of a
+setup entrypoint; it is not a supported image or required deployment path.
 
 ## Limitations
 

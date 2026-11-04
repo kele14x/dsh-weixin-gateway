@@ -6,13 +6,7 @@ Priority: **P1** denotes a high-priority reliability or access-control defect; *
 
 ## Open issues
 
-### 4. P1 — A fresh Docker home volume is not writable by the service user
-
-- **Location:** [docker/Dockerfile:23–28](docker/Dockerfile#L23), [docker/compose.yaml:14–24](docker/compose.yaml#L14), [docker/entrypoint.sh:10–16](docker/entrypoint.sh#L10).
-- **Trigger:** Start the documented deployment with a new `dsh-home` named volume. The image does not initialize `/data/dsh` ownership before switching to UID 1000.
-- **Impact:** The root-owned volume prevents profile registration and credential/state writes.
-- **Evidence:** Static review of the image, mount, and entrypoint. A fresh Docker deployment was not executed during this review.
-- **Fix direction:** Initialize the persistent home with ownership appropriate for the service user before running registration or login.
+None currently.
 
 ## Fixed issues
 
@@ -30,10 +24,9 @@ All nine fixes below are included in `8d77e08` and covered by offline regression
 | 9. P2 — Verification ignores timeout/abort | Bound input by the remaining login deadline and abort signal, including readline cancellation. | [auth](test/auth.test.mjs), [CLI](test/cli.test.mjs) |
 | 10. P2 — Retry restarts after shutdown | Track startup/shutdown/drains and tear down the old generation before restarting. | [gateway](test/gateway.test.mjs) |
 
-The deployment findings were resolved by removing the project-owned systemd
-installer and service. The plugin now provides only an optional, configurable
-[DSH Host service example](examples/systemd/dsh-host.service), with complete
-manual preparation and lifecycle guidance in the [README](README.md#example-systemd-user-service):
+The former systemd deployment findings were resolved by removing project-owned
+Host setup. The plugin now provides only an optional, operator-configured
+[systemd example](examples/systemd/dsh-host.service):
 
 - **11. P1 — Fresh systemd installation can fail before workspace creation:** the
   operator must create the configured workspace before enabling the example.
@@ -54,5 +47,5 @@ manual preparation and lifecycle guidance in the [README](README.md#example-syst
 
 - Before committing `8d77e08`, all **137 offline tests** passed in three consecutive runs, plus `npm run check` and `git diff --check`.
 - Each run included 100 fresh and 100 stale lock trials with five contenders, plus separate-process contention for both cases. This is regression evidence, not proof of every schedule or filesystem behavior.
-- Tests used macOS, fake Host/client interfaces, temporary files, loopback HTTP, child processes, and offline readline streams. Only disposable fixture accounts were logged out; no live WeChat account, fresh Docker deployment, or Linux systemd execution was tested.
+- Tests used macOS, fake Host/client interfaces, temporary files, loopback HTTP, child processes, and offline readline streams. Only disposable fixture accounts were logged out; no live WeChat account, Docker Host example, or Linux systemd execution was tested.
 - The initial npm audit at `0f798c1` reported zero known dependency vulnerabilities; dependency manifests remain unchanged. This is not an exhaustive security assessment.

@@ -1,22 +1,11 @@
 #!/usr/bin/env node
-/**
- * Container healthcheck.
- *
- * WeChat has no listening socket, so liveness is "a poller holds the lock and
- * the lock heartbeat is fresh". The gateway touches the lock after every
- * successful poll, at most every 15 seconds.
- *
- * @module docker/healthcheck
- */
 
 import { readFile, readdir, stat } from 'node:fs/promises'
 import { join } from 'node:path'
 
 const STALE_MS = 120_000
-
 const home = process.env.DSH_HOME ?? join(process.env.HOME ?? '/data', '.dsh')
-const stateDir = join(home, 'integrations', 'dsh-weixin')
-const lockDir = join(stateDir, 'lock')
+const lockDir = join(home, 'integrations', 'dsh-weixin', 'lock')
 
 let entries = []
 try {
@@ -57,7 +46,6 @@ try {
     console.error('unhealthy: poller pid is gone')
     process.exit(1)
   }
-  // EPERM or an unreadable document: the heartbeat age is the stronger signal.
 }
 
 console.log(`healthy: last poll ${Math.round(age / 1000)}s ago`)

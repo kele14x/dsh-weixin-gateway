@@ -75,7 +75,7 @@ export const Config = z.object({
   debugLogContent: z
     .boolean()
     .default(false)
-    .description('Allow raw message text in debug logs. Off by default and never enabled in Docker.'),
+    .description('Allow raw message text in debug logs. Off by default; avoid in unattended deployments.'),
   botAgent: z
     .string()
     .description('Observability-only bot_agent token; not authentication.'),
