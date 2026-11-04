@@ -14,30 +14,6 @@ Priority: **P1** denotes a high-priority reliability or access-control defect; *
 - **Evidence:** Static review of the image, mount, and entrypoint. A fresh Docker deployment was not executed during this review.
 - **Fix direction:** Initialize the persistent home with ownership appropriate for the service user before running registration or login.
 
-### 11. P1 — Fresh systemd installation can fail before workspace creation
-
-- **Location:** [deploy/systemd/dsh-weixin-gateway.service:38](deploy/systemd/dsh-weixin-gateway.service#L38), [deploy/systemd/install.sh:36–39](deploy/systemd/install.sh#L36), [src/index.mjs:79–83](src/index.mjs#L79).
-- **Trigger:** Install the service before an interactive plugin run has created the untracked `workspace/` directory.
-- **Impact:** Systemd must enter the directory before launching DSH, but directory creation happens inside the plugin. Startup therefore fails with `CHDIR` and repeatedly restarts.
-- **Evidence:** Static review; no systemd service was installed or executed on the macOS review host.
-- **Fix direction:** Create and validate the intended workspace before enabling the service.
-
-### 12. P2 — The systemd unit assumes a particular checkout location
-
-- **Location:** [deploy/systemd/dsh-weixin-gateway.service:38](deploy/systemd/dsh-weixin-gateway.service#L38), [deploy/systemd/install.sh:36–39](deploy/systemd/install.sh#L36).
-- **Trigger:** Run the installer from a checkout outside `$HOME/Workspaces/dsh-weixin-gateway`.
-- **Impact:** The unchanged unit starts in a nonexistent directory or in another checkout's workspace, rather than the installed checkout's workspace.
-- **Evidence:** Static review of the hardcoded path and the installer's unchanged copy operation.
-- **Fix direction:** Resolve the checkout's actual workspace during installation or require and validate an explicit working-directory setting.
-
-### 13. P2 — The installer accepts a DSH executable the unit cannot launch
-
-- **Location:** [deploy/systemd/install.sh:33–35](deploy/systemd/install.sh#L33), [deploy/systemd/dsh-weixin-gateway.service:52](deploy/systemd/dsh-weixin-gateway.service#L52).
-- **Trigger:** `dsh` is available on `PATH`, for example under `/usr/local/bin`, Linuxbrew, or an npm prefix, but `$HOME/.local/bin/dsh` is absent.
-- **Impact:** The installer accepts the executable discovery result, while `ExecStart` uses a different hardcoded path and fails with `EXEC`.
-- **Evidence:** Static review; executable discovery and the unit's launch path are not coordinated.
-- **Fix direction:** Resolve and validate the executable actually used by the unit, including its Node runtime environment, before enabling the service.
-
 ## Fixed issues
 
 All nine fixes below are included in `8d77e08` and covered by offline regression tests.
@@ -53,6 +29,18 @@ All nine fixes below are included in `8d77e08` and covered by offline regression
 | 8. P2 — Initial creation overwrites `/new` | Serialize creation and reset per sender, including failure recovery. | [session router](test/session-router.test.mjs) |
 | 9. P2 — Verification ignores timeout/abort | Bound input by the remaining login deadline and abort signal, including readline cancellation. | [auth](test/auth.test.mjs), [CLI](test/cli.test.mjs) |
 | 10. P2 — Retry restarts after shutdown | Track startup/shutdown/drains and tear down the old generation before restarting. | [gateway](test/gateway.test.mjs) |
+
+The deployment findings were resolved by removing the project-owned systemd
+installer and service. The plugin now provides only an optional, configurable
+[DSH Host service example](examples/systemd/dsh-host.service), with complete
+manual preparation and lifecycle guidance in the [README](README.md#example-systemd-user-service):
+
+- **11. P1 — Fresh systemd installation can fail before workspace creation:** the
+  operator must create the configured workspace before enabling the example.
+- **12. P2 — The systemd unit assumes a particular checkout location:** the
+  example uses an operator-selected workspace rather than a checkout path.
+- **13. P2 — The installer accepts a DSH executable the unit cannot launch:** no
+  installer remains; the operator must configure the absolute DSH and Node paths.
 
 ## Remaining limitations
 

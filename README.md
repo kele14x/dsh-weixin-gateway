@@ -60,32 +60,105 @@ Then send the bot a direct message and reply `/bind choose-a-code`.
 `node bin/dsh-weixin.mjs status` and `node bin/dsh-weixin.mjs logout` are also
 available; `login` never starts a poller, so restart the Host afterwards.
 
-## Run as a user service
+## Example: systemd user service
 
-The channel lives inside the Host, so the supervised process is `dsh web`, not a
-separate daemon. The unit in `deploy/systemd/` keeps it running after the
-terminal closes and across reboots:
+Host process management is outside this plugin's responsibilities. On Linux
+with systemd, [`examples/systemd/dsh-host.service`](examples/systemd/dsh-host.service)
+is an optional example for supervising the **entire DSH Host**, including any
+other plugins loaded in its `web` profile. It is not a standalone gateway service
+or a ready-to-install unit; configure and manage it yourself.
+
+### Prepare the Host and customize the unit
+
+Complete **Install** and **Log in and pair** first, using the same user and
+`DSH_HOME` as the service. If you already supervise this Host, configure that
+service instead of starting another. If `dsh-host.service` already exists, choose
+a different unit name and adjust the commands below rather than overwriting it.
+Run the following from this checkout as your normal user, not with `sudo`:
 
 ```sh
-deploy/systemd/install.sh                 # install, enable, start
-journalctl --user -u dsh-weixin-gateway -f
+command -v dsh
+command -v node
+mkdir -p "$HOME/dsh-workspace"
+mkdir -p "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+install -m 0644 examples/systemd/dsh-host.service \
+  "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/dsh-host.service"
 ```
 
-It starts in `workspace/` and passes `--no-open`, so no browser is launched at
-boot; the UI is still served on `127.0.0.1:3080` and its URL is printed to the
-journal. It retries every 10 s without ever latching into `failed`, and allows
-45 s to shut down. Optional overrides go in
-`~/.config/dsh-weixin-gateway.env`, mode `0600`:
+Edit the installed unit before starting it:
+
+- Replace `/absolute/path/to/dsh` in `ExecStart` with the absolute executable path
+  reported above. Resolve any shell alias or function to an actual executable.
+- Replace `/absolute/path/to/node-bin` in `PATH` with the directory containing
+  `node`. Add directories needed by DSH and agent tools; systemd does not load
+  your shell configuration, including nvm or other version-manager setup.
+- `DSH_HOME=%h/.dsh` must match the home containing your registered `web` profile
+  and WeChat credentials. `%h` means this user's home directory.
+- `WorkingDirectory` and `DSH_WEIXIN_CWD` both use `%h/dsh-workspace` so the Host's
+  sandbox root matches new WeChat sessions. To use another workspace, change
+  both values and create that directory before starting the service.
+
+If pairing is still needed, create or reuse `~/.config/dsh-weixin-gateway.env`
+with mode `0600` and set a fresh code there rather than storing it in the unit:
 
 ```sh
-DSH_WEIXIN_BIND_CODE=choose-a-code
+mkdir -p "$HOME/.config"
+(umask 077; touch "$HOME/.config/dsh-weixin-gateway.env")
+chmod 0600 "$HOME/.config/dsh-weixin-gateway.env"
 ```
 
-Restart the unit after editing that file: `/bind` reads the variable from the
-process environment. `loginctl enable-linger "$USER"` is what lets the Host
-start at boot without a login; the installer warns when lingering is off. Stop
-the unit before running `dsh web` by hand — a second poller trips iLink's `-14`
-guard.
+Edit that file to set the following, preserving any other existing overrides:
+
+```ini
+DSH_WEIXIN_BIND_CODE=replace-with-a-fresh-code
+```
+
+### Start and inspect
+
+Stop any manually started Host using this account before enabling the service:
+
+```sh
+systemctl --user daemon-reload
+systemctl --user enable --now dsh-host.service
+systemctl --user status dsh-host.service --no-pager
+journalctl --user -u dsh-host.service -f
+```
+
+The example uses `--no-open` to avoid launching a browser; the Host prints its UI
+address to the journal. It retries after 10 seconds even after repeated startup
+failures and allows 45 seconds for shutdown. If startup fails, check the journal
+for missing workspace, executable, Node runtime, or profile configuration.
+
+To run after reboot without logging in, enable lingering if permitted by your
+system's policy:
+
+```sh
+loginctl enable-linger "$USER"
+```
+
+After editing the unit, run `systemctl --user daemon-reload` and
+`systemctl --user restart dsh-host.service`. Environment-file changes need only
+the restart; send `/bind <code>` to redeem a fresh pairing code.
+
+### Stop or remove
+
+Stopping this service stops the whole Host, not just the WeChat plugin. Stop it
+before running the same Host manually. The local lock prevents two processes
+on this machine from polling the same account, but does not coordinate replicas
+on different machines.
+
+```sh
+systemctl --user stop dsh-host.service
+```
+
+To remove only this example's service registration, leaving DSH, the plugin,
+credentials, and workspace intact:
+
+```sh
+systemctl --user disable --now dsh-host.service
+rm "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/dsh-host.service"
+systemctl --user daemon-reload
+```
 
 ## Commands
 
