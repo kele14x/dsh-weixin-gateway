@@ -1,0 +1,304 @@
+#!/usr/bin/env node
+/**
+ * Operator CLI: QR login, status, and logout.
+ *
+ * This never starts a poller. It writes credentials for the running gateway to
+ * pick up on its next start, which keeps the one-poller rule intact.
+ *
+ * @module dsh-weixin-gateway/bin
+ */
+
+import { existsSync } from 'node:fs'
+import { homedir } from 'node:os'
+import { join, resolve } from 'node:path'
+import { rm } from 'node:fs/promises'
+import { pathToFileURL } from 'node:url'
+import { createInterface } from 'node:readline/promises'
+import { AccountStore, maskToken } from '../src/store/accounts.mjs'
+import { ChannelState } from '../src/store/state.mjs'
+import { AllowList } from '../src/store/allowed.mjs'
+import { ILinkClient } from '../src/ilink/client.mjs'
+import { LoginError, runQrLogin } from '../src/ilink/auth.mjs'
+import { VERSION, botAgentFor } from '../src/ilink/constants.mjs'
+
+const USAGE = `dsh-weixin ${VERSION}
+
+Usage:
+  dsh-weixin login   [--state-dir <path>] [--base-url <url>] [--force] [--no-qr]
+  dsh-weixin status  [--state-dir <path>]
+  dsh-weixin logout  [--state-dir <path>] [--yes]
+
+State directory defaults to $DSH_HOME/integrations/dsh-weixin, or
+~/.dsh/integrations/dsh-weixin when DSH_HOME is unset.
+
+login scans a QR code and stores bot credentials (mode 0600).
+status prints accounts and cursor/session counts; it never prints tokens.
+logout removes the stored account, its state, and its allowlist.`
+
+/**
+ * Parse argv into a command and flags.
+ *
+ * @param {string[]} argv - process arguments after the script name.
+ * @returns {{command: string, stateDir?: string, baseUrl?: string, force: boolean, yes: boolean, noQr: boolean}} parsed CLI input.
+ */
+export function parseArgs(argv) {
+  const [command = 'help', ...rest] = argv
+  const options = { command, force: false, yes: false, noQr: false }
+  for (let index = 0; index < rest.length; index += 1) {
+    const argument = rest[index]
+    switch (argument) {
+      case '--state-dir':
+        options.stateDir = rest[++index]
+        break
+      case '--base-url':
+        options.baseUrl = rest[++index]
+        break
+      case '--force':
+        options.force = true
+        break
+      case '--yes':
+      case '-y':
+        options.yes = true
+        break
+      case '--no-qr':
+        options.noQr = true
+        break
+      default:
+        throw new Error(`unknown argument: ${argument}`)
+    }
+  }
+  return options
+}
+
+/**
+ * Resolve the state directory the same way the bundle patch does.
+ *
+ * @param {string|undefined} override - `--state-dir` value.
+ * @param {NodeJS.ProcessEnv} [env] - environment.
+ * @returns {string} absolute state directory.
+ */
+export function resolveStateDir(override, env = process.env) {
+  if (override !== undefined) return resolve(override)
+  if (typeof env.DSH_HOME === 'string' && env.DSH_HOME.length > 0) {
+    return join(resolve(env.DSH_HOME), 'integrations', 'dsh-weixin')
+  }
+  return join(homedir(), '.dsh', 'integrations', 'dsh-weixin')
+}
+
+/**
+ * Render a scannable QR code, falling back to the payload URL.
+ *
+ * @param {{qrcode?: string, qrcodeImgContent?: string}} qr - QR payload.
+ * @returns {Promise<void>} resolves after rendering.
+ */
+async function renderQr({ qrcode, qrcodeImgContent }) {
+  const payload =
+    typeof qrcodeImgContent === 'string' && qrcodeImgContent.length > 0 ? qrcodeImgContent : qrcode
+  if (typeof payload !== 'string' || payload.length === 0) {
+    console.log('The server returned no QR payload; scan the URL printed by the login flow instead.')
+    return
+  }
+  try {
+    const module = await import('qrcode-terminal')
+    const generator = module.default ?? module
+    generator.generate(payload, { small: true }, (rendered) => console.log(rendered))
+  } catch {
+    console.log(`QR payload: ${payload}`)
+  }
+}
+
+/**
+ * `dsh-weixin login`.
+ *
+ * @param {object} options - parsed CLI options.
+ * @param {AccountStore} accounts - account store.
+ * @returns {Promise<number>} exit code.
+ */
+async function login(options, accounts) {
+  const existing = await accounts.latest()
+  if (existing !== null && options.force !== true) {
+    console.log(`An account is already stored: ${existing.botId} (token ${maskToken(existing.botToken)}).`)
+    console.log('Start the DSH Host (dsh web) to run the gateway.')
+    console.log('Re-run with --force only if you intend to replace the bot credential.')
+    return 0
+  }
+
+  console.log('Starting WeChat QR login ...')
+  const client = new ILinkClient({
+    baseUrl: options.baseUrl,
+    botAgent: botAgentFor(VERSION),
+  })
+
+  const readline = createInterface({ input: process.stdin, output: process.stdout })
+  const io = {
+    print: (line) => console.log(line),
+    prompt: async (question) => (await readline.question(question)).trim(),
+  }
+
+  try {
+    const credentials = await runQrLogin({
+      client,
+      io,
+      localTokens: existing === null ? [] : [existing.botToken],
+      onQrcode: options.noQr === true ? undefined : (qr) => void renderQr(qr),
+    })
+
+    const path = await accounts.save({
+      ...credentials,
+      botAgent: botAgentFor(VERSION),
+    })
+
+    console.log('')
+    console.log('Login succeeded.')
+    console.log(`  bot id:   ${credentials.botId}`)
+    console.log(`  token:    ${maskToken(credentials.botToken)}`)
+    console.log(`  base url: ${credentials.baseUrl}`)
+    console.log(`  owner:    ${credentials.ownerUserId ?? '(unknown)'}`)
+    console.log(`  stored:   ${path}`)
+    console.log('')
+    console.log('Next: start the DSH Host (dsh web). Then send the bot a direct message;')
+    console.log('pair the chat with /bind <code> using the code from DSH_WEIXIN_BIND_CODE.')
+    return 0
+  } catch (error) {
+    if (error instanceof LoginError) {
+      console.error(`Login failed (${error.code}): ${error.message}`)
+      return 1
+    }
+    console.error(`Login failed: ${error.message}`)
+    return 1
+  } finally {
+    readline.close()
+  }
+}
+
+/**
+ * `dsh-weixin status`.
+ *
+ * @param {object} options - parsed CLI options.
+ * @param {string} stateDir - state directory.
+ * @param {AccountStore} accounts - account store.
+ * @returns {Promise<number>} exit code.
+ */
+async function status(options, stateDir, accounts) {
+  const records = await accounts.list()
+  if (records.length === 0) {
+    console.log(`No WeChat account stored in ${stateDir}. Run: dsh-weixin login`)
+    return 0
+  }
+
+  for (const record of records) {
+    console.log(`account: ${record.botId}`)
+    console.log(`  token:    ${maskToken(record.botToken)}`)
+    console.log(`  base url: ${record.baseUrl}`)
+    console.log(`  owner:    ${record.ownerUserId ?? '(unknown)'}`)
+    console.log(`  saved:    ${new Date(record.savedAt ?? 0).toISOString()}`)
+
+    const state = new ChannelState({ stateDir, botId: record.botId })
+    try {
+      await state.load()
+      const summary = state.summary()
+      console.log(`  cursor:   ${summary.cursorLength === 0 ? '(empty)' : 'stored'}`)
+      console.log(`  sessions: ${summary.sessions} mapped`)
+      console.log(`  contexts: ${summary.contextTokens} remembered`)
+    } catch (error) {
+      console.log(`  state:    unreadable (${error.message})`)
+    }
+
+    const allowed = new AllowList({ stateDir })
+    await allowed.load()
+    console.log(`  paired:   ${allowed.size} sender(s)`)
+
+    const lockPath = join(stateDir, 'lock', `${record.botId}.lock`)
+    console.log(`  lock:     ${existsSync(lockPath) ? 'held' : 'free'}`)
+    console.log('')
+  }
+  return 0
+}
+
+/**
+ * `dsh-weixin logout`.
+ *
+ * @param {object} options - parsed CLI options.
+ * @param {string} stateDir - state directory.
+ * @param {AccountStore} accounts - account store.
+ * @returns {Promise<number>} exit code.
+ */
+async function logout(options, stateDir, accounts) {
+  const record = await accounts.latest()
+  if (record === null) {
+    console.log('No WeChat account to remove.')
+    return 0
+  }
+
+  if (options.yes !== true) {
+    const readline = createInterface({ input: process.stdin, output: process.stdout })
+    const answer = (await readline.question(`Remove ${record.botId}, its cursor/sessions, and pairings? [y/N] `)).trim()
+    readline.close()
+    if (!/^y(es)?$/i.test(answer)) {
+      console.log('Aborted.')
+      return 1
+    }
+  }
+
+  await accounts.remove(record.botId)
+  const state = new ChannelState({ stateDir, botId: record.botId })
+  await state.load().catch(() => {})
+  await rm(state.file, { force: true })
+  await rm(join(stateDir, 'allowed.json'), { force: true })
+  await rm(join(stateDir, 'lock', `${record.botId}.lock`), { force: true })
+
+  console.log(`Removed ${record.botId}. The running gateway, if any, must be restarted.`)
+  return 0
+}
+
+/**
+ * CLI entry point.
+ *
+ * @param {string[]} [argv] - argument override for tests.
+ * @param {NodeJS.ProcessEnv} [env] - environment override.
+ * @returns {Promise<number>} exit code.
+ */
+export async function main(argv = process.argv.slice(2), env = process.env) {
+  let options
+  try {
+    options = parseArgs(argv)
+  } catch (error) {
+    console.error(error.message)
+    console.error(USAGE)
+    return 2
+  }
+
+  if (options.command === 'help' || options.command === '--help' || options.command === '-h') {
+    console.log(USAGE)
+    return 0
+  }
+
+  const stateDir = resolveStateDir(options.stateDir, env)
+  const accounts = new AccountStore({ stateDir })
+
+  switch (options.command) {
+    case 'login':
+      return login(options, accounts)
+    case 'status':
+      return status(options, stateDir, accounts)
+    case 'logout':
+      return logout(options, stateDir, accounts)
+    default:
+      console.error(`unknown command: ${options.command}`)
+      console.error(USAGE)
+      return 2
+  }
+}
+
+const isDirectRun =
+  process.argv[1] !== undefined && import.meta.url === pathToFileURL(resolve(process.argv[1])).href
+
+if (isDirectRun) {
+  main().then(
+    (code) => process.exit(code),
+    (error) => {
+      console.error(error)
+      process.exit(1)
+    },
+  )
+}

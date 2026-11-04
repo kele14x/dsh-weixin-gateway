@@ -1,0 +1,42 @@
+{
+  "name": "dsh-weixin-gateway",
+  "version": "0.1.0",
+  "private": true,
+  "description": "DSH-native WeChat (iLink Bot) channel plugin. Outbound-only; no OpenClaw runtime.",
+  "type": "module",
+  "main": "./src/index.mjs",
+  "exports": {
+    ".": "./src/index.mjs",
+    "./package.json": "./package.json"
+  },
+  "bin": {
+    "dsh-weixin": "./bin/dsh-weixin.mjs"
+  },
+  "files": [
+    "bin",
+    "src",
+    "docker",
+    "third_party",
+    "cordis.patch.yml",
+    "THIRD_PARTY_NOTICES.md",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "scripts": {
+    "test": "node --test test/",
+    "check": "node --check src/index.mjs && node --check bin/dsh-weixin.mjs"
+  },
+  "dependencies": {
+    "@deepseek-ai/schemastery": "~3.18.5",
+    "qrcode-terminal": "^0.12.0"
+  },
+  "license": "MIT"
+}

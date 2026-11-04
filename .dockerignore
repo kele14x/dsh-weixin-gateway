@@ -1,0 +1,10 @@
+node_modules
+.npm-cache
+.tmp-test-*
+.tmp-home-*
+.git
+.gitignore
+test
+*.log
+data
+workspace

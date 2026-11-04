@@ -1,0 +1,16 @@
+# Bundle patch for dsh-weixin-gateway.
+#
+# Installing the package adds this file to the profile's bundle layers. The row
+# below mounts the channel inside the Host process; it opens no socket and
+# needs only the Session Controller service.
+#
+# `stateDir` and `defaultCwd` are required by the plugin schema. The defaults
+# here keep a WeChat deployment self-contained under the DSH home.
+
+- insert:
+    - id: weixin-channel
+      name: dsh-weixin-gateway
+      config:
+        stateDir: !!js dshHomePath('integrations/dsh-weixin')
+        defaultCwd: !!js process.env.DSH_WEIXIN_CWD ?? process.cwd()
+        maxMessageChars: 1800
