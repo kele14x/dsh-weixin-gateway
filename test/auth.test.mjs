@@ -136,3 +136,34 @@ test('a confirmed response without a token is a protocol error', async () => {
     (error) => error instanceof LoginError && error.code === 'protocol',
   )
 })
+
+test('a transient status-poll failure is treated as wait, not a failed login', async () => {
+  const client = authClient([
+    { status: 'wait' },
+    {
+      status: 'confirmed',
+      bot_token: 'tok',
+      ilink_bot_id: 'bot',
+      baseurl: 'https://api.test',
+    },
+  ])
+  const original = client.getQrcodeStatus.bind(client)
+  let first = true
+  client.getQrcodeStatus = async (args) => {
+    if (first) {
+      first = false
+      const error = new Error('request timed out')
+      error.code = 'timeout'
+      throw error
+    }
+    return original(args)
+  }
+
+  const credentials = await runQrLogin({
+    client,
+    io: fakeIo(),
+    pollIntervalMs: 1,
+    timeoutMs: 1000,
+  })
+  assert.equal(credentials.botId, 'bot')
+})

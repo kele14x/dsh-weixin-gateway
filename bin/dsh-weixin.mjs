@@ -24,7 +24,7 @@ import { VERSION, botAgentFor } from '../src/ilink/constants.mjs'
 const USAGE = `dsh-weixin ${VERSION}
 
 Usage:
-  dsh-weixin login   [--state-dir <path>] [--base-url <url>] [--force] [--no-qr]
+  dsh-weixin login   [--state-dir <path>] [--base-url <url>] [--force] [--no-qr] [--show-url]
   dsh-weixin status  [--state-dir <path>]
   dsh-weixin logout  [--state-dir <path>] [--yes]
 
@@ -39,11 +39,11 @@ logout removes the stored account, its state, and its allowlist.`
  * Parse argv into a command and flags.
  *
  * @param {string[]} argv - process arguments after the script name.
- * @returns {{command: string, stateDir?: string, baseUrl?: string, force: boolean, yes: boolean, noQr: boolean}} parsed CLI input.
+ * @returns {{command: string, stateDir?: string, baseUrl?: string, force: boolean, yes: boolean, noQr: boolean, showUrl: boolean}} parsed CLI input.
  */
 export function parseArgs(argv) {
   const [command = 'help', ...rest] = argv
-  const options = { command, force: false, yes: false, noQr: false }
+  const options = { command, force: false, yes: false, noQr: false, showUrl: false }
   for (let index = 0; index < rest.length; index += 1) {
     const argument = rest[index]
     switch (argument) {
@@ -62,6 +62,9 @@ export function parseArgs(argv) {
         break
       case '--no-qr':
         options.noQr = true
+        break
+      case '--show-url':
+        options.showUrl = true
         break
       default:
         throw new Error(`unknown argument: ${argument}`)
@@ -139,8 +142,24 @@ async function login(options, accounts) {
     const credentials = await runQrLogin({
       client,
       io,
+      // Give an operator enough time to fetch a phone and scan.
+      timeoutMs: 300_000,
       localTokens: existing === null ? [] : [existing.botToken],
-      onQrcode: options.noQr === true ? undefined : (qr) => void renderQr(qr),
+      onQrcode:
+        options.noQr === true
+          ? undefined
+          : (qr) => {
+              if (options.showUrl === true) {
+                const payload =
+                  typeof qr.qrcodeImgContent === 'string' && qr.qrcodeImgContent.length > 0
+                    ? qr.qrcodeImgContent
+                    : qr.qrcode
+                if (typeof payload === 'string' && payload.length > 0) {
+                  console.log(`QR payload (open this on the phone, or scan below): ${payload}`)
+                }
+              }
+              return renderQr(qr)
+            },
     })
 
     const path = await accounts.save({

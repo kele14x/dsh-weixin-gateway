@@ -91,7 +91,22 @@ export async function runQrLogin({
   while (now() < deadline) {
     if (signal?.aborted) throw new LoginError('aborted', 'login was cancelled')
 
-    const status = await client.getQrcodeStatus({ qrcode, verifyCode, signal })
+    let status
+    try {
+      status = await client.getQrcodeStatus({ qrcode, verifyCode, signal })
+    } catch (error) {
+      if (signal?.aborted || error.code === 'aborted') throw error
+      // Tencent's own client maps a failed status poll to `wait` and keeps
+      // polling; aborting here would kill a login over one transient timeout.
+      if (error.code === 'timeout' || error.code === 'network' || (error.code === 'http' && error.retryable)) {
+        logger.warn('QR status poll failed; retrying', { reason: error.message })
+        const remaining = deadline - now()
+        if (remaining <= 0) break
+        await sleepFn(Math.min(pollIntervalMs, remaining), signal)
+        continue
+      }
+      throw error
+    }
     const value = status?.status
 
     if (value !== lastStatus) {
