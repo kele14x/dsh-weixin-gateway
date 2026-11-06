@@ -215,9 +215,16 @@ Queue size, timeouts, and backoff are in `src/config.mjs`.
 - A second Host on the same machine (a manual `dsh web`, another unit) refuses to
   poll, then retries every 30 s and adopts the account as soon as the first owner
   exits. Taking over a stale lock is atomic, so two starters cannot both claim it.
+- Local lock recovery compares boot identity and process start time on Linux and
+  macOS to detect a reused PID. Matching or unverifiable live owners stay
+  protected regardless of heartbeat age; older locks without generation metadata
+  may still need operator inspection.
 - Long-poll or network errors: backoff, cursor kept.
 - Send errors: one retry on a plain network failure, reusing the message ID as a
   server-side deduplication hint, then log; never claims success.
+- QR login: HTTP requests use the remaining overall login budget, capped by the
+  client's shorter request timeout; credentials arriving after the deadline are
+  rejected.
 - Turn timeout or a missing session: an actionable reply, never a fabricated
   answer.
 
@@ -227,7 +234,7 @@ Queue size, timeouts, and backoff are in `src/config.mjs`.
 npm test
 ```
 
-154 offline tests against a fake iLink client and fake Host — no WeChat account is
+232 offline tests using fake iLink/Host interfaces and disposable fixtures — no WeChat account is
 used.
 
 ## Example: Docker Host

@@ -67,9 +67,10 @@ DSH rejects wildcard binds. The example pins the container to `172.28.0.2`, bind
 the UI there, and publishes it only as `127.0.0.1:3080`. Remove `ports`,
 `--trusted-host`, and `--public-url` if the UI is unnecessary.
 
-The healthcheck reports healthy when a poller owns the local lock and its
-heartbeat is less than two minutes old. It does not probe a listening gateway
-socket because WeChat traffic is outbound HTTPS.
+The healthcheck requires a valid local lock record, a verifiable live PID, and
+lock-file freshness of less than two minutes. Corrupt records and PID-check
+errors are unhealthy. This checks local liveness, not successful WeChat delivery;
+it does not probe a listening gateway socket because traffic is outbound HTTPS.
 
 ## Operate and remove
 

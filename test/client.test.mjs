@@ -80,6 +80,64 @@ test('QR status polling is a GET with application headers only', async () => {
   )
 })
 
+for (const method of ['getBotQrcode', 'getQrcodeStatus']) {
+  test(`${method} caps an optional QR budget at the shorter client timeout`, async (t) => {
+    const client = new ILinkClient({ timeoutMs: 200 })
+    const request = t.mock.method(client, 'request', async () => ({ qrcode: 'QR-1', status: 'wait' }))
+    for (const timeoutMs of [undefined, 50, 500]) {
+      await client[method]({ qrcode: 'QR-1', ...(timeoutMs === undefined ? {} : { timeoutMs }) })
+    }
+    assert.deepEqual(request.mock.calls.map(({ arguments: [args] }) => args.timeoutMs), [200, 50, 200])
+  })
+
+  for (const phase of ['fetch', 'acknowledgement']) {
+    for (const cancellation of ['login-budget', 'client-timeout', 'external-abort']) {
+      test(`${method} cancels ${phase} on ${cancellation}`, { timeout: 1000 }, async (t) => {
+        // AbortSignal.timeout is unref'ed; keep the network-free transport test alive.
+        const keepAlive = setInterval(() => {}, 1000)
+        t.after(() => clearInterval(keepAlive))
+        const controller = new AbortController()
+        let requestSignal
+        let reads = 0
+        const waitForAbort = (signal) => new Promise((_, reject) => {
+          const onAbort = () => reject(signal.reason)
+          signal.addEventListener('abort', onAbort, { once: true })
+          if (cancellation === 'external-abort') controller.abort()
+          if (signal.aborted) onAbort()
+        })
+        const client = new ILinkClient({
+          timeoutMs: cancellation === 'client-timeout' ? 20 : 500,
+          fetchImpl: async (_url, { signal }) => {
+            requestSignal = signal
+            if (phase === 'fetch') return waitForAbort(signal)
+            return {
+              ok: true,
+              text() {
+                reads += 1
+                return waitForAbort(signal)
+              },
+            }
+          },
+        })
+
+        await assert.rejects(
+          client[method]({
+            qrcode: 'QR-1',
+            timeoutMs: cancellation === 'login-budget' ? 20 : 500,
+            signal: controller.signal,
+          }),
+          (error) => cancellation === 'external-abort'
+            ? error.code === 'aborted'
+            : error instanceof ILinkError && error.code === 'timeout' && error.retryable,
+        )
+        assert.equal(requestSignal.aborted, true)
+        assert.equal(controller.signal.aborted, cancellation === 'external-abort')
+        assert.equal(reads, phase === 'acknowledgement' ? 1 : 0)
+      })
+    }
+  }
+}
+
 test('sendMessage carries auth, base_info, and the reply context token', async () => {
   await withHttpServer(
     () => ({ body: { ret: 0 } }),

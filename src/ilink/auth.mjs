@@ -103,8 +103,22 @@ export async function runQrLogin({
 }) {
   const start = now()
   const deadline = start + timeoutMs
+  const remainingBudget = () => {
+    if (signal?.aborted) throw new LoginError('aborted', 'login was cancelled')
+    const remaining = deadline - now()
+    if (remaining <= 0) throw new LoginError('timeout', 'QR login timed out; run login again')
+    return remaining
+  }
 
-  const { qrcode, qrcodeImgContent } = await client.getBotQrcode({ localTokens, signal })
+  let qr
+  try {
+    qr = await client.getBotQrcode({ localTokens, signal, timeoutMs: remainingBudget() })
+  } catch (error) {
+    remainingBudget()
+    throw error
+  }
+  remainingBudget()
+  const { qrcode, qrcodeImgContent } = qr
   if (typeof qrcode !== 'string' || qrcode.length === 0) {
     throw new LoginError('protocol', 'the QR response did not contain a qrcode value')
   }
@@ -122,13 +136,12 @@ export async function runQrLogin({
   let lastStatus
 
   while (now() < deadline) {
-    if (signal?.aborted) throw new LoginError('aborted', 'login was cancelled')
-
     let status
     try {
-      status = await client.getQrcodeStatus({ qrcode, verifyCode, signal })
+      status = await client.getQrcodeStatus({ qrcode, verifyCode, signal, timeoutMs: remainingBudget() })
     } catch (error) {
-      if (signal?.aborted || error.code === 'aborted') throw error
+      remainingBudget()
+      if (error.code === 'aborted') throw error
       // Tencent's own client maps a failed status poll to `wait` and keeps
       // polling; aborting here would kill a login over one transient timeout.
       if (error.code === 'timeout' || error.code === 'network' || (error.code === 'http' && error.retryable)) {
@@ -140,6 +153,7 @@ export async function runQrLogin({
       }
       throw error
     }
+    remainingBudget()
     const value = status?.status
 
     if (value !== lastStatus) {
@@ -168,8 +182,7 @@ export async function runQrLogin({
           throw new LoginError('verify-code-blocked', 'too many incorrect verification codes')
         }
         const answer = await promptVerification(io, deadline - now(), signal)
-        if (signal?.aborted) throw new LoginError('aborted', 'login was cancelled')
-        if (now() >= deadline) throw new LoginError('timeout', 'QR login timed out; run login again')
+        remainingBudget()
         if (typeof answer !== 'string' || answer.trim().length === 0) {
           throw new LoginError('verify-code-required', 'a verification code is required to finish login')
         }
@@ -183,6 +196,7 @@ export async function runQrLogin({
           'too many incorrect verification codes; run login again to get a fresh QR code',
         )
       case QR_STATUS.confirmed: {
+        remainingBudget()
         if (typeof status.bot_token !== 'string' || status.bot_token.length === 0) {
           throw new LoginError('protocol', 'confirmed login did not include a bot token')
         }

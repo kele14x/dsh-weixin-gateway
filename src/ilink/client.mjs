@@ -290,15 +290,17 @@ export class ILinkClient {
    *
    * @param {object} [options] - request options.
    * @param {string[]} [options.localTokens] - recent tokens, at most ten.
+   * @param {number} [options.timeoutMs] - remaining login budget, capped by the client timeout.
    * @param {AbortSignal} [options.signal] - caller lifetime.
    * @returns {Promise<{qrcode: string, qrcodeImgContent?: string}>} QR payload.
    */
-  async getBotQrcode({ localTokens = [], signal } = {}) {
+  async getBotQrcode({ localTokens = [], timeoutMs = this.timeoutMs, signal } = {}) {
     const data = await this.request({
       kind: 'qr',
       path: PATHS.botQrcode,
       query: { bot_type: '3' },
       body: { local_token_list: localTokens.slice(0, 10) },
+      timeoutMs: Math.min(this.timeoutMs, timeoutMs),
       signal,
     })
     return {
@@ -313,10 +315,11 @@ export class ILinkClient {
    * @param {object} options - poll options.
    * @param {string} options.qrcode - QR value from `getBotQrcode`.
    * @param {string} [options.verifyCode] - code shown on the phone.
+   * @param {number} [options.timeoutMs] - remaining login budget, capped by the client timeout.
    * @param {AbortSignal} [options.signal] - caller lifetime.
    * @returns {Promise<object>} raw status document.
    */
-  async getQrcodeStatus({ qrcode, verifyCode, signal }) {
+  async getQrcodeStatus({ qrcode, verifyCode, timeoutMs = this.timeoutMs, signal }) {
     return this.request({
       kind: 'app',
       method: 'GET',
@@ -326,7 +329,7 @@ export class ILinkClient {
         ...(verifyCode === undefined || verifyCode === '' ? {} : { verify_code: verifyCode }),
       },
       signal,
-      timeoutMs: this.timeoutMs,
+      timeoutMs: Math.min(this.timeoutMs, timeoutMs),
     })
   }
 

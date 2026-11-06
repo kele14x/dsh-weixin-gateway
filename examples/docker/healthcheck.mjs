@@ -40,12 +40,21 @@ if (age > STALE_MS) {
 
 try {
   const holder = JSON.parse(await readFile(newest.file, 'utf8'))
-  process.kill(Number(holder.pid), 0)
-} catch (error) {
-  if (error?.code === 'ESRCH') {
-    console.error('unhealthy: poller pid is gone')
+  if (
+    holder === null || typeof holder !== 'object' || Array.isArray(holder) ||
+    !Number.isInteger(holder.pid) || holder.pid <= 0 ||
+    typeof holder.token !== 'string' || holder.token.trim().length === 0 ||
+    typeof holder.host !== 'string' || holder.host.trim().length === 0
+  ) {
+    console.error('unhealthy: invalid poller lock holder')
     process.exit(1)
   }
+  process.kill(holder.pid, 0)
+} catch (error) {
+  console.error(error?.code === 'ESRCH'
+    ? 'unhealthy: poller pid is gone'
+    : 'unhealthy: cannot read or verify poller lock')
+  process.exit(1)
 }
 
 console.log(`healthy: last poll ${Math.round(age / 1000)}s ago`)
