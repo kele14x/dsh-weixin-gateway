@@ -1,12 +1,58 @@
 # Known issues
 
-Updated on 2026-11-04. Findings were reviewed at `a7d8f49`; the nine offline fixes were committed in `8d77e08`. Original issue numbers are retained.
+Updated on 2026-11-06. New findings were reviewed at `1497dc2`. Previous findings were reviewed at `a7d8f49`; the nine offline fixes were committed in `8d77e08`. Original issue numbers are retained.
 
-Priority: **P1** denotes a high-priority reliability or access-control defect; **P2** denotes a correctness or deployment defect.
+Priority: **P1** denotes a high-priority reliability or access-control defect; **P2** denotes a correctness or deployment defect; **P3** denotes a lower-priority correctness or diagnostic defect.
 
 ## Open issues
 
-None currently.
+### 14. P2 — Outbound retries generate a new message ID
+
+- **Location:** [runtime](src/runtime.mjs#L820), [client](src/ilink/client.mjs#L381).
+- **Finding:** Each attempt calls `sendMessage` without a fixed `clientId`. If the first request is accepted but reading its acknowledgement fails, the retry sends identical text with a different `client_id`, potentially causing duplicate delivery. An offline reproduction through the real request implementation confirmed two attempts with distinct IDs.
+- **Suggested correction:** Generate one ID per chunk and reuse it across retries; add a lost-acknowledgement regression test.
+
+### 15. P2 — Chunking removes significant indentation
+
+- **Location:** [chunking](src/util/chunk.mjs#L50).
+- **Finding:** Independently trimming every chunk removes meaningful whitespace. At the default 1,800-character limit, splitting `'#' + 'x'.repeat(1788) + '\ndef f():\n    return 42'` produced a second chunk of `return 42`, losing all four indentation spaces and corrupting the Python output.
+- **Suggested correction:** Preserve whitespace across chunk boundaries while handling entirely blank input separately; add an indented-code regression test.
+
+### 16. P2 — Schema-valid zero chunk size disables replies
+
+- **Location:** [configuration](src/config.mjs#L39), [chunk validation](src/util/chunk.mjs#L23), [reply path](src/runtime.mjs#L794).
+- **Finding:** `.natural()` accepts `maxMessageChars: 0`, but `splitText` requires a positive integer. The schema accepted zero in an offline reproduction, after which chunking a nonempty reply threw `RangeError`. This affects answers, pairing replies, and error notices.
+- **Suggested correction:** Require a positive chunk size in the configuration schema and test rejection of zero.
+
+### 17. P2 — Logout can reactivate a previously replaced account
+
+- **Location:** [forced login](bin/dsh-weixin.mjs#L173), [logout](bin/dsh-weixin.mjs#L280), [startup account selection](src/store/accounts.mjs#L127).
+- **Finding:** Switching account A to B with `login --force` preserves A's credential. Logging out B removes only B, so `latest()` subsequently selects A. An offline reproduction using the actual CLI and mocked HTTP returned successful logout, then restarted a fake-transport gateway with A and status `running`.
+- **Suggested correction:** Make active-account selection explicit and clear it on logout, rather than silently falling back to an older stored credential.
+
+### 18. P2 — Same-value retries falsely acknowledge persistence
+
+- **Location:** [write failure handling](src/store/state.mjs#L114), [cursor setter](src/store/state.mjs#L130), [context-token setter](src/store/state.mjs#L155).
+- **Finding:** Failed writes leave the new value in memory and state dirty. Retrying that same value returns at the equality check without flushing. For both setters, removing a disposable write obstruction and retrying resolved successfully while the state file remained absent; an explicit `flush()` subsequently persisted it. Durable state can remain stale until another mutation or shutdown.
+- **Suggested correction:** Flush pending dirty state even for unchanged values; add failed-write/same-value-retry regressions.
+
+### 19. P2 — PID reuse prevents abandoned-lock recovery
+
+- **Location:** [process probe](src/store/lock.mjs#L45), [local staleness check](src/store/lock.mjs#L87).
+- **Finding:** Local lock recovery checks only whether the recorded PID exists, ignoring heartbeat age. After a crash or reboot, an unrelated process with a recycled PID can block startup and logout indefinitely. A disposable lock with heartbeat `1` and an unrelated live PID was refused even with `staleMs: 1`. This simulated PID reuse; actual OS PID recycling was not exercised.
+- **Suggested correction:** Verify process-generation identity, such as boot identity and process start time, without allowing an old heartbeat alone to evict a genuinely live owner.
+
+### 20. P3 — HTTP phases bypass the overall QR-login deadline
+
+- **Location:** [QR creation](src/ilink/auth.mjs#L107), [status polling](src/ilink/auth.mjs#L129), [confirmation](src/ilink/auth.mjs#L185).
+- **Finding:** HTTP operations do not receive the remaining overall login budget, and confirmation is accepted without rechecking the deadline. A real client with injected, network-free transport returned credentials after 42 ms despite a 10-ms login timeout. This is separate from the fixed verification-input timeout.
+- **Suggested correction:** Bound QR creation and status requests by the overall deadline and recheck it before accepting credentials.
+
+### 21. P3 — Docker example healthcheck accepts malformed locks
+
+- **Location:** [healthcheck error handling](examples/docker/healthcheck.mjs#L41).
+- **Finding:** The catch block rejects only `ESRCH`, ignoring JSON parsing and other PID-validation errors. A recent malformed lock containing `{broken-json`, with no running gateway, produced `healthy: last poll 0s ago` and exit code `0` in an offline reproduction.
+- **Suggested correction:** Reject malformed lock records and invalid PID checks instead of reporting healthy; add a malformed-lock regression test.
 
 ## Fixed issues
 
@@ -45,6 +91,8 @@ Host setup. The plugin now provides only an optional, operator-configured
 
 ## Validation and scope
 
+- Review of `1497dc2` on 2026-11-06: all **137 offline tests** passed, along with `npm run check` and `git diff --check`. A production dependency audit through the official npm registry reported zero vulnerabilities; the configured mirror did not support the audit endpoint.
+- All eight new findings were independently reproduced using injected transports or cleaned-up disposable fixtures. PID reuse was simulated, not triggered through OS PID recycling. No live WeChat account, live DSH integration, Docker deployment, or Linux systemd execution was exercised; the Docker healthcheck script was run locally.
 - Before committing `8d77e08`, all **137 offline tests** passed in three consecutive runs, plus `npm run check` and `git diff --check`.
 - Each run included 100 fresh and 100 stale lock trials with five contenders, plus separate-process contention for both cases. This is regression evidence, not proof of every schedule or filesystem behavior.
 - Tests used macOS, fake Host/client interfaces, temporary files, loopback HTTP, child processes, and offline readline streams. Only disposable fixture accounts were logged out; no live WeChat account, Docker Host example, or Linux systemd execution was tested.
