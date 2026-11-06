@@ -207,8 +207,8 @@ Queue size, timeouts, and backoff are in `src/config.mjs`.
   poll, then retries every 30 s and adopts the account as soon as the first owner
   exits. Taking over a stale lock is atomic, so two starters cannot both claim it.
 - Long-poll or network errors: backoff, cursor kept.
-- Send errors: one retry on a plain network failure, then log; never claims
-  success.
+- Send errors: one retry on a plain network failure, reusing the message ID so a
+  lost acknowledgement cannot deliver it twice, then log; never claims success.
 - Turn timeout or a missing session: an actionable reply, never a fabricated
   answer.
 
@@ -218,7 +218,7 @@ Queue size, timeouts, and backoff are in `src/config.mjs`.
 npm test
 ```
 
-76 offline tests against a fake iLink client and fake Host — no WeChat account is
+142 offline tests against a fake iLink client and fake Host — no WeChat account is
 used.
 
 ## Example: Docker Host

@@ -38,6 +38,7 @@ export const Config = z.object({
     .description('iLink API origin. A QR redirect may override it for the saved account.'),
   maxMessageChars: z
     .natural()
+    .min(1)
     .default(MAX_TEXT_CHARS)
     .description('Maximum code points per outbound WeChat message.'),
   chunkDelayMs: z

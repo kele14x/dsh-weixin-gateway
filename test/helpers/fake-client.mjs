@@ -21,6 +21,7 @@ export class FakeClient {
     this.notifications = []
     this.configCalls = 0
     this.failNextSends = 0
+    this.loseNextAcks = 0
     this.pausedOnce = false
     this.waiter = undefined
     this.aborted = false
@@ -79,9 +80,10 @@ export class FakeClient {
   }
 
   /**
-   * Record one outbound text message.
+   * Record one outbound text message. `loseNextAcks` records the message and
+   * then fails, as if the server accepted it but the response was lost.
    *
-   * @param {{toUserId: string, text: string, contextToken?: string}} message - message.
+   * @param {{toUserId: string, text: string, contextToken?: string, clientId?: string}} message - message.
    * @returns {Promise<{clientId: string}>} receipt.
    */
   async sendMessage(message) {
@@ -93,7 +95,14 @@ export class FakeClient {
       throw error
     }
     this.sent.push(message)
-    return { clientId: 'fake-client-id' }
+    if (this.loseNextAcks > 0) {
+      this.loseNextAcks -= 1
+      const error = new Error('network error')
+      error.code = 'network'
+      error.retryable = true
+      throw error
+    }
+    return { clientId: message.clientId ?? 'fake-client-id' }
   }
 
   /**

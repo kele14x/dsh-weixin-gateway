@@ -6,24 +6,6 @@ Priority: **P1** denotes a high-priority reliability or access-control defect; *
 
 ## Open issues
 
-### 14. P2 — Outbound retries generate a new message ID
-
-- **Location:** [runtime](src/runtime.mjs#L820), [client](src/ilink/client.mjs#L381).
-- **Finding:** Each attempt calls `sendMessage` without a fixed `clientId`. If the first request is accepted but reading its acknowledgement fails, the retry sends identical text with a different `client_id`, potentially causing duplicate delivery. An offline reproduction through the real request implementation confirmed two attempts with distinct IDs.
-- **Suggested correction:** Generate one ID per chunk and reuse it across retries; add a lost-acknowledgement regression test.
-
-### 15. P2 — Chunking removes significant indentation
-
-- **Location:** [chunking](src/util/chunk.mjs#L50).
-- **Finding:** Independently trimming every chunk removes meaningful whitespace. At the default 1,800-character limit, splitting `'#' + 'x'.repeat(1788) + '\ndef f():\n    return 42'` produced a second chunk of `return 42`, losing all four indentation spaces and corrupting the Python output.
-- **Suggested correction:** Preserve whitespace across chunk boundaries while handling entirely blank input separately; add an indented-code regression test.
-
-### 16. P2 — Schema-valid zero chunk size disables replies
-
-- **Location:** [configuration](src/config.mjs#L39), [chunk validation](src/util/chunk.mjs#L23), [reply path](src/runtime.mjs#L794).
-- **Finding:** `.natural()` accepts `maxMessageChars: 0`, but `splitText` requires a positive integer. The schema accepted zero in an offline reproduction, after which chunking a nonempty reply threw `RangeError`. This affects answers, pairing replies, and error notices.
-- **Suggested correction:** Require a positive chunk size in the configuration schema and test rejection of zero.
-
 ### 17. P2 — Logout can reactivate a previously replaced account
 
 - **Location:** [forced login](bin/dsh-weixin.mjs#L173), [logout](bin/dsh-weixin.mjs#L280), [startup account selection](src/store/accounts.mjs#L127).
@@ -69,6 +51,14 @@ All nine fixes below are included in `8d77e08` and covered by offline regression
 | 8. P2 — Initial creation overwrites `/new` | Serialize creation and reset per sender, including failure recovery. | [session router](test/session-router.test.mjs) |
 | 9. P2 — Verification ignores timeout/abort | Bound input by the remaining login deadline and abort signal, including readline cancellation. | [auth](test/auth.test.mjs), [CLI](test/cli.test.mjs) |
 | 10. P2 — Retry restarts after shutdown | Track startup/shutdown/drains and tear down the old generation before restarting. | [gateway](test/gateway.test.mjs) |
+
+The following outbound-reply fixes followed separately and are also covered by offline regression tests.
+
+| Issue | Resolution | Regression coverage |
+| --- | --- | --- |
+| 14. P2 — Outbound retries generate a new message ID | Generate one `clientId` per chunk and reuse it on the retry, so a lost acknowledgement cannot deliver the chunk twice. | [gateway](test/gateway.test.mjs) |
+| 15. P2 — Chunking removes significant indentation | Prefer newline splits over space splits and drop only the whitespace at a split, so a chunk that starts a line keeps its indentation. | [chunk](test/chunk.test.mjs) |
+| 16. P2 — Schema-valid zero chunk size disables replies | Require `maxMessageChars` to be at least 1 in the configuration schema. | [plugin](test/plugin.test.mjs) |
 
 The former systemd deployment findings were resolved by removing project-owned
 Host setup. The plugin now provides only an optional, operator-configured

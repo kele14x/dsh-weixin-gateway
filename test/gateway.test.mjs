@@ -211,6 +211,25 @@ test('a long reply is chunked under the configured limit', async (t) => {
   assert.equal(client.sent.map((message) => message.text).join(''), long)
 })
 
+test('a retry after a lost acknowledgement reuses the chunk client id', async (t) => {
+  const { client, gateway } = await setup(t, {
+    msgs: [textMessage()],
+    hostOptions: { reply: () => 'part one\npart two' },
+    config: { maxMessageChars: 10 },
+  })
+  client.loseNextAcks = 1
+  await gateway.start()
+  await waitFor(() => client.sent.length === 3, { message: 'retry and second chunk' })
+
+  const [first, retry, second] = client.sent
+  assert.equal(first.text, 'part one')
+  assert.equal(retry.text, 'part one')
+  assert.equal(typeof first.clientId, 'string')
+  assert.equal(retry.clientId, first.clientId)
+  assert.equal(second.text, 'part two')
+  assert.notEqual(second.clientId, first.clientId)
+})
+
 test('a completed turn without text still produces a notice', async (t) => {
   const { client, gateway } = await setup(t, {
     msgs: [textMessage()],

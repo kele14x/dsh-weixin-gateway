@@ -817,11 +817,14 @@ export class Gateway {
    * @returns {Promise<boolean>} true when the server accepted it.
    */
   async #sendChunk(userId, chunk) {
+    // A retry reuses the id so a lost acknowledgement cannot deliver the chunk twice.
+    const clientId = randomUUID()
     const send = () =>
       this.client.sendMessage({
         toUserId: userId,
         text: chunk,
         contextToken: this.state.contextTokenFor(userId),
+        clientId,
         signal: this.abort?.signal,
       })
 

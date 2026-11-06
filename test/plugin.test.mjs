@@ -40,6 +40,11 @@ test('the plugin export is named and has a config schema', () => {
   assert.equal(resolved.bindCodeEnv, 'DSH_WEIXIN_BIND_CODE')
 })
 
+test('the config schema rejects a zero chunk size', () => {
+  assert.throws(() => Config({ stateDir: '/tmp/state', maxMessageChars: 0 }))
+  assert.equal(Config({ stateDir: '/tmp/state', maxMessageChars: 1 }).maxMessageChars, 1)
+})
+
 test('a relative stateDir disables the channel instead of mounting', () => {
   const { ctx, record } = fakeCtx()
   apply(ctx, { stateDir: 'relative/state', defaultCwd: process.cwd(), logLevel: 'silent' })
