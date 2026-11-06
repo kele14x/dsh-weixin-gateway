@@ -138,11 +138,11 @@ export class Gateway {
     const signal = this.abort.signal
 
     try {
-      const account = await raceAbort(this.accounts.latest(), signal)
+      const account = await raceAbort(this.accounts.active(), signal)
       if (account === null) {
         this.status = 'unconfigured'
         this.logger.warn(
-          'no WeChat account is stored; run `dsh-weixin login` (or `npx dsh-weixin login`) and restart the Host',
+          'no active WeChat account is selected; run `dsh-weixin login` (or `npx dsh-weixin login`) and restart the Host',
           { stateDir: this.config.stateDir },
         )
         return
@@ -817,7 +817,7 @@ export class Gateway {
    * @returns {Promise<boolean>} true when the server accepted it.
    */
   async #sendChunk(userId, chunk) {
-    // A retry reuses the id so a lost acknowledgement cannot deliver the chunk twice.
+    // Keep the server's deduplication hint stable if the acknowledgement is lost.
     const clientId = randomUUID()
     const send = () =>
       this.client.sendMessage({

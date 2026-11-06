@@ -60,6 +60,15 @@ Then send the bot a direct message and reply `/bind choose-a-code`.
 `node bin/dsh-weixin.mjs status` and `node bin/dsh-weixin.mjs logout` are also
 available; `login` never starts a poller, so restart the Host afterwards.
 
+Login selects the active account explicitly. `login --force` replaces that
+selection while keeping older credentials inactive; `status` identifies the
+active account. Logout removes the active account and clears the selection,
+so restarting the Host never reactivates an older credential.
+
+When upgrading from a version without explicit account selection, run `login`
+once and restart the Host. Existing credentials remain stored but inactive
+until a successful login establishes the selection.
+
 ## Example: systemd user service
 
 Host process management is outside this plugin's responsibilities. On Linux
@@ -207,8 +216,8 @@ Queue size, timeouts, and backoff are in `src/config.mjs`.
   poll, then retries every 30 s and adopts the account as soon as the first owner
   exits. Taking over a stale lock is atomic, so two starters cannot both claim it.
 - Long-poll or network errors: backoff, cursor kept.
-- Send errors: one retry on a plain network failure, reusing the message ID so a
-  lost acknowledgement cannot deliver it twice, then log; never claims success.
+- Send errors: one retry on a plain network failure, reusing the message ID as a
+  server-side deduplication hint, then log; never claims success.
 - Turn timeout or a missing session: an actionable reply, never a fabricated
   answer.
 
@@ -218,7 +227,7 @@ Queue size, timeouts, and backoff are in `src/config.mjs`.
 npm test
 ```
 
-142 offline tests against a fake iLink client and fake Host — no WeChat account is
+154 offline tests against a fake iLink client and fake Host — no WeChat account is
 used.
 
 ## Example: Docker Host

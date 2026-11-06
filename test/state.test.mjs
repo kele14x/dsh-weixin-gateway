@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdir, stat, writeFile } from 'node:fs/promises'
+import { mkdir, rm, stat, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { ChannelState } from '../src/store/state.mjs'
 import { makeTempDir, cleanup } from './helpers/tmp.mjs'
@@ -27,6 +27,31 @@ test('cursor persists and an empty cursor is ignored', async (t) => {
   const reopened = await loadedState(dir)
   assert.equal(reopened.cursor, 'cursor-1')
 })
+
+for (const field of ['cursor', 'contextToken']) {
+  for (const concurrent of [false, true]) {
+    test(`${field} same-value ${concurrent ? 'concurrent callers and retries' : 'retry'} persists after a failed write`, async (t) => {
+      const dir = await makeTempDir('state-retry')
+      t.after(() => cleanup(dir))
+      const state = await loadedState(dir)
+      const update = () => field === 'cursor'
+        ? state.setCursor('cursor-1')
+        : state.setContextToken('user-1', 'ctx-1')
+      await writeFile(state.dir, 'disposable write obstruction')
+      if (concurrent) {
+        const results = await Promise.allSettled([update(), update()])
+        assert.deepEqual(results.map((result) => result.status), ['rejected', 'rejected'])
+      } else {
+        await assert.rejects(update)
+      }
+      await rm(state.dir)
+      await update()
+      const reopened = await loadedState(dir)
+      if (field === 'cursor') assert.equal(reopened.cursor, 'cursor-1')
+      else assert.equal(reopened.contextTokenFor('user-1'), 'ctx-1')
+    })
+  }
+}
 
 test('session mappings survive a reload', async (t) => {
   const dir = await makeTempDir('state')

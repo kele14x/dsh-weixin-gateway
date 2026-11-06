@@ -129,9 +129,9 @@ export function createLoginIo(readline) {
  * @returns {Promise<number>} exit code.
  */
 async function login(options, accounts) {
-  const existing = await accounts.latest()
+  const existing = await accounts.active()
   if (existing !== null && options.force !== true) {
-    console.log(`An account is already stored: ${existing.botId} (token ${maskToken(existing.botToken)}).`)
+    console.log(`An account is already active: ${existing.botId} (token ${maskToken(existing.botToken)}).`)
     console.log('Start the DSH Host (dsh web) to run the gateway.')
     console.log('Re-run with --force only if you intend to replace the bot credential.')
     return 0
@@ -213,6 +213,8 @@ async function status(options, stateDir, accounts) {
     return 0
   }
 
+  const active = await accounts.active()
+  console.log(`active account: ${active?.botId ?? '(none)'}`)
   for (const record of records) {
     console.log(`account: ${record.botId}`)
     console.log(`  token:    ${maskToken(record.botToken)}`)
@@ -251,7 +253,7 @@ async function status(options, stateDir, accounts) {
  * @returns {Promise<number>} exit code.
  */
 async function logout(options, stateDir, accounts) {
-  const record = await accounts.latest()
+  const record = await accounts.active()
   if (record === null) {
     console.log('No WeChat account to remove.')
     return 0

@@ -2,11 +2,12 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { getEventListeners } from 'node:events'
 import { join } from 'node:path'
-import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { createInterface } from 'node:readline/promises'
 import { PassThrough } from 'node:stream'
 import { createLoginIo, main, parseArgs } from '../bin/dsh-weixin.mjs'
 import { LoginError, runQrLogin } from '../src/ilink/auth.mjs'
+import { ILinkClient } from '../src/ilink/client.mjs'
 import { AccountStore, safeBotId } from '../src/store/accounts.mjs'
 import { ChannelState } from '../src/store/state.mjs'
 import { acquireLock } from '../src/store/lock.mjs'
@@ -27,7 +28,7 @@ async function storeFixture(stateDir, botId = 'bot-1') {
   await writeFile(state.file, JSON.stringify({ cursor: 'stored-cursor', sessions: { sender: 'session' } }))
   const allowedPath = join(stateDir, 'allowed.json')
   await writeFile(allowedPath, JSON.stringify({ senders: ['sender'] }))
-  return [accountPath, state.file, allowedPath]
+  return [accountPath, state.file, allowedPath, accounts.activeFile]
 }
 
 async function snapshot(paths) {
@@ -112,6 +113,72 @@ test('logout releases its lock when credential deletion fails', async (t) => {
   await assert.rejects(() => readFile(lockPath), { code: 'ENOENT' })
   const nextOwner = await acquireLock(lockPath)
   await nextOwner.release()
+})
+
+test('forced login replaces the active account and logout cannot reactivate an older credential', async (t) => {
+  const output = captureOutput(t)
+  const stateDir = await makeTempDir('cli-switch-account')
+  t.after(() => cleanup(stateDir))
+  const accounts = new AccountStore({ stateDir })
+  await accounts.save({ botId: 'old-bot', botToken: 'old-token', baseUrl: 'https://api.test' })
+  t.mock.method(ILinkClient.prototype, 'getBotQrcode', async () => ({ qrcode: 'offline-qr' }))
+  t.mock.method(ILinkClient.prototype, 'getQrcodeStatus', async () => ({
+    status: 'confirmed', bot_token: 'new-token', ilink_bot_id: 'new-bot', baseurl: 'https://api.test',
+  }))
+
+  assert.equal(await main(['login', '--state-dir', stateDir, '--force', '--no-qr']), 0)
+  assert.equal((await accounts.active()).botId, 'new-bot')
+  assert.equal((await stat(accounts.activeFile)).mode & 0o777, 0o600)
+  assert.equal(await main(['status', '--state-dir', stateDir]), 0)
+  assert.ok(output.logs.includes('active account: new-bot'))
+  assert.equal(await main(['logout', '--state-dir', stateDir, '--yes']), 0)
+
+  const reopened = new AccountStore({ stateDir })
+  assert.equal(await reopened.active(), null)
+  assert.equal(await reopened.load('new-bot'), null)
+  assert.equal((await reopened.load('old-bot')).botToken, 'old-token')
+  assert.equal(await main(['status', '--state-dir', stateDir]), 0)
+  assert.ok(output.logs.includes('active account: (none)'))
+  assert.equal(await main(['logout', '--state-dir', stateDir, '--yes']), 0)
+  assert.equal((await reopened.load('old-bot')).botToken, 'old-token')
+})
+
+test('a failed forced login keeps the previous active account', async (t) => {
+  captureOutput(t)
+  const stateDir = await makeTempDir('cli-failed-login')
+  t.after(() => cleanup(stateDir))
+  const accounts = new AccountStore({ stateDir })
+  await accounts.save({ botId: 'old-bot', botToken: 'old-token', baseUrl: 'https://api.test' })
+  t.mock.method(ILinkClient.prototype, 'getBotQrcode', async () => ({ qrcode: 'offline-qr' }))
+  t.mock.method(ILinkClient.prototype, 'getQrcodeStatus', async () => ({ status: 'expired' }))
+
+  assert.equal(await main(['login', '--state-dir', stateDir, '--force', '--no-qr']), 1)
+  assert.equal((await accounts.active()).botId, 'old-bot')
+})
+
+test('removing an inactive credential keeps the selected account', async (t) => {
+  const stateDir = await makeTempDir('cli-inactive-account')
+  t.after(() => cleanup(stateDir))
+  const accounts = new AccountStore({ stateDir })
+  await accounts.save({ botId: 'old-bot', botToken: 'old-token', baseUrl: 'https://api.test' })
+  await accounts.save({ botId: 'new-bot', botToken: 'new-token', baseUrl: 'https://api.test' })
+  const path = accounts.pathFor('old-bot')
+  const old = JSON.parse(await readFile(path, 'utf8'))
+  await writeFile(path, JSON.stringify({ ...old, savedAt: Date.now() + 60_000 }))
+  assert.equal((await accounts.active()).botId, 'new-bot')
+  await accounts.remove('old-bot')
+  assert.equal((await accounts.active()).botId, 'new-bot')
+})
+
+test('a failed active-selection write does not activate the saved credential', async (t) => {
+  const stateDir = await makeTempDir('cli-selection-failure')
+  t.after(() => cleanup(stateDir))
+  const accounts = new AccountStore({ stateDir })
+  await mkdir(accounts.activeFile)
+  await assert.rejects(() => accounts.save({ botId: 'bot', botToken: 'token', baseUrl: 'https://api.test' }))
+  await rm(accounts.activeFile, { recursive: true })
+  assert.equal(await accounts.active(), null)
+  assert.equal((await accounts.load('bot')).botId, 'bot')
 })
 
 for (const reason of ['timeout', 'aborted']) {

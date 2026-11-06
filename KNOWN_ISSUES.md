@@ -6,18 +6,6 @@ Priority: **P1** denotes a high-priority reliability or access-control defect; *
 
 ## Open issues
 
-### 17. P2 — Logout can reactivate a previously replaced account
-
-- **Location:** [forced login](bin/dsh-weixin.mjs#L173), [logout](bin/dsh-weixin.mjs#L280), [startup account selection](src/store/accounts.mjs#L127).
-- **Finding:** Switching account A to B with `login --force` preserves A's credential. Logging out B removes only B, so `latest()` subsequently selects A. An offline reproduction using the actual CLI and mocked HTTP returned successful logout, then restarted a fake-transport gateway with A and status `running`.
-- **Suggested correction:** Make active-account selection explicit and clear it on logout, rather than silently falling back to an older stored credential.
-
-### 18. P2 — Same-value retries falsely acknowledge persistence
-
-- **Location:** [write failure handling](src/store/state.mjs#L114), [cursor setter](src/store/state.mjs#L130), [context-token setter](src/store/state.mjs#L155).
-- **Finding:** Failed writes leave the new value in memory and state dirty. Retrying that same value returns at the equality check without flushing. For both setters, removing a disposable write obstruction and retrying resolved successfully while the state file remained absent; an explicit `flush()` subsequently persisted it. Durable state can remain stale until another mutation or shutdown.
-- **Suggested correction:** Flush pending dirty state even for unchanged values; add failed-write/same-value-retry regressions.
-
 ### 19. P2 — PID reuse prevents abandoned-lock recovery
 
 - **Location:** [process probe](src/store/lock.mjs#L45), [local staleness check](src/store/lock.mjs#L87).
@@ -52,13 +40,15 @@ All nine fixes below are included in `8d77e08` and covered by offline regression
 | 9. P2 — Verification ignores timeout/abort | Bound input by the remaining login deadline and abort signal, including readline cancellation. | [auth](test/auth.test.mjs), [CLI](test/cli.test.mjs) |
 | 10. P2 — Retry restarts after shutdown | Track startup/shutdown/drains and tear down the old generation before restarting. | [gateway](test/gateway.test.mjs) |
 
-The following outbound-reply fixes followed separately and are also covered by offline regression tests.
+The following reply and state fixes followed separately and are also covered by offline regression tests.
 
 | Issue | Resolution | Regression coverage |
 | --- | --- | --- |
-| 14. P2 — Outbound retries generate a new message ID | Generate one `clientId` per chunk and reuse it on the retry, so a lost acknowledgement cannot deliver the chunk twice. | [gateway](test/gateway.test.mjs) |
+| 14. P2 — Outbound retries generate a new message ID | Generate one `clientId` per chunk and reuse it on the retry as a server-side deduplication hint. | [gateway](test/gateway.test.mjs) |
 | 15. P2 — Chunking removes significant indentation | Prefer newline splits over space splits and drop only the whitespace at a split, so a chunk that starts a line keeps its indentation. | [chunk](test/chunk.test.mjs) |
 | 16. P2 — Schema-valid zero chunk size disables replies | Require `maxMessageChars` to be at least 1 in the configuration schema. | [plugin](test/plugin.test.mjs) |
+| 17. P2 — Logout can reactivate a previously replaced account | Login persists an explicit active-account selection; logout clears it before deleting the active credential. Startup never falls back to older credentials. | [CLI](test/cli.test.mjs), [gateway](test/gateway.test.mjs) |
+| 18. P2 — Same-value retries falsely acknowledge persistence | Cursor and context-token setters flush pending writes even when the value is unchanged, including concurrent callers. | [state](test/state.test.mjs) |
 
 The former systemd deployment findings were resolved by removing project-owned
 Host setup. The plugin now provides only an optional, operator-configured
@@ -81,6 +71,7 @@ Host setup. The plugin now provides only an optional, operator-configured
 
 ## Validation and scope
 
+- Working-tree fixes for issues 17 and 18 on 2026-11-06: all **154 offline tests** passed, plus `npm run check`, explicit syntax checks of the changed source modules, and `git diff --check`. Coverage includes forced account replacement, logout without fallback, missing/corrupt selection, failed selection writes, and failed state writes with same-value retries and concurrent callers. No live WeChat account or DSH Host was exercised.
 - Review of `1497dc2` on 2026-11-06: all **137 offline tests** passed, along with `npm run check` and `git diff --check`. A production dependency audit through the official npm registry reported zero vulnerabilities; the configured mirror did not support the audit endpoint.
 - All eight new findings were independently reproduced using injected transports or cleaned-up disposable fixtures. PID reuse was simulated, not triggered through OS PID recycling. No live WeChat account, live DSH integration, Docker deployment, or Linux systemd execution was exercised; the Docker healthcheck script was run locally.
 - Before committing `8d77e08`, all **137 offline tests** passed in three consecutive runs, plus `npm run check` and `git diff --check`.

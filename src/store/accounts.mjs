@@ -46,6 +46,7 @@ export class AccountStore {
   constructor({ stateDir }) {
     this.stateDir = stateDir
     this.dir = join(stateDir, 'accounts')
+    this.activeFile = join(stateDir, 'active-account.json')
   }
 
   /**
@@ -59,7 +60,7 @@ export class AccountStore {
   }
 
   /**
-   * Persist one account, replacing any previous record for the same bot id.
+   * Persist and activate one account, replacing any record for the same bot id.
    *
    * @param {object} account - credential record.
    * @param {string} account.botId - server account id.
@@ -84,6 +85,7 @@ export class AccountStore {
     }
     const path = this.pathFor(botId)
     await writeJsonAtomic(path, record, { mode: 0o600 })
+    await writeJsonAtomic(this.activeFile, { version: 1, botId }, { mode: 0o600 })
     return path
   }
 
@@ -120,13 +122,17 @@ export class AccountStore {
   }
 
   /**
-   * The most recently saved account, used on startup.
+   * The explicitly selected account, used on startup.
    *
-   * @returns {Promise<object|null>} newest record or null.
+   * @returns {Promise<object|null>} selected record or null.
    */
-  async latest() {
-    const records = await this.list()
-    return records[0] ?? null
+  async active() {
+    const selection = await readJson(this.activeFile, null)
+    if (selection === null) return null
+    if (selection.version !== 1 || typeof selection.botId !== 'string' || selection.botId.length === 0) {
+      throw new Error(`unexpected active-account document shape in ${this.activeFile}`)
+    }
+    return this.load(selection.botId)
   }
 
   /**
@@ -136,6 +142,8 @@ export class AccountStore {
    * @returns {Promise<void>} resolves once removed.
    */
   async remove(botId) {
+    const selection = await readJson(this.activeFile, null)
+    if (selection?.botId === botId) await removeFile(this.activeFile)
     await removeFile(this.pathFor(botId))
   }
 }

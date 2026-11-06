@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import { Gateway } from '../src/runtime.mjs'
@@ -317,6 +317,28 @@ test('a missing credential disables the channel with a diagnostic', async (t) =>
   assert.equal(gateway.status, 'unconfigured')
 })
 
+for (const selection of ['missing', 'dangling']) {
+  test(`a ${selection} active-account selection cannot fall back to another credential`, async (t) => {
+    const { accounts, client, gateway } = await setup(t)
+    if (selection === 'missing') await rm(accounts.activeFile)
+    else await writeFile(accounts.activeFile, JSON.stringify({ version: 1, botId: 'absent-bot' }))
+    await gateway.start()
+    assert.equal(gateway.status, 'unconfigured')
+    assert.equal((await accounts.load('bot1')).botId, 'bot1')
+    assert.deepEqual(client.notifications, [])
+  })
+}
+
+for (const selection of ['{broken-json', '{"version":1,"botId":42}']) {
+  test(`an invalid active-account selection fails startup: ${selection}`, async (t) => {
+    const { accounts, client, gateway } = await setup(t)
+    await writeFile(accounts.activeFile, selection)
+    await assert.rejects(() => gateway.start(), /not valid JSON|unexpected active-account document shape/)
+    assert.equal(gateway.status, 'error')
+    assert.deepEqual(client.notifications, [])
+  })
+}
+
 test('a -14 response pauses and then resumes polling', async (t) => {
   const { client, gateway } = await setup(t)
   client.pausedOnce = 'pending'
@@ -628,12 +650,12 @@ test('an in-flight lock retry cannot restart polling after shutdown', async (t) 
   const { config, accounts, client, gateway } = await setup(t, { gatewayOptions: { lockRetryMs: 10 } })
   const owner = await acquireLock(join(config.stateDir, 'lock', 'bot1.lock'))
   t.after(() => owner.release())
-  const account = await accounts.latest()
+  const account = await accounts.active()
   await gateway.start()
   assert.equal(gateway.status, 'locked')
   const lookup = Promise.withResolvers()
   t.after(() => lookup.resolve(account))
-  accounts.latest = () => lookup.promise
+  accounts.active = () => lookup.promise
   await waitFor(() => gateway.status === 'starting')
   await gateway.stop()
   await owner.release()

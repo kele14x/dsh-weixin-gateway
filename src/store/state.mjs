@@ -129,9 +129,10 @@ export class ChannelState {
    */
   async setCursor(cursor) {
     if (typeof cursor !== 'string' || cursor.length === 0) return
-    if (cursor === this.cursor) return
-    this.cursor = cursor
-    this.#dirty = true
+    if (cursor !== this.cursor) {
+      this.cursor = cursor
+      this.#dirty = true
+    }
     await this.flush()
   }
 
@@ -154,9 +155,10 @@ export class ChannelState {
    */
   async setContextToken(userId, token) {
     if (typeof token !== 'string' || token.length === 0) return
-    if (this.contextTokens.get(userId) === token) return
-    this.contextTokens.set(userId, token)
-    this.#dirty = true
+    if (this.contextTokens.get(userId) !== token) {
+      this.contextTokens.set(userId, token)
+      this.#dirty = true
+    }
     await this.flush()
   }
 
