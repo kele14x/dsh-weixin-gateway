@@ -35,18 +35,10 @@ The following fixes followed separately and are also covered by offline regressi
 | 18. P2 — Same-value retries falsely acknowledge persistence | Cursor and context-token setters flush pending writes even when the value is unchanged, including concurrent callers. | [state](test/state.test.mjs) |
 | 19. P2 — PID reuse prevents abandoned-lock recovery | Persist boot identity and process start time; recover a local lock when the recorded generation differs. Matching or unverifiable live owners remain protected regardless of heartbeat age. | [lock](test/lock.test.mjs) |
 | 20. P3 — HTTP phases bypass the overall QR-login deadline | Cap QR HTTP requests at the remaining overall budget and the shorter client timeout; reject late responses and credentials. | [auth](test/auth.test.mjs), [client](test/client.test.mjs) |
-| 21. P3 — Docker example healthcheck accepts malformed locks | Reject corrupt JSON, invalid holder fields, and any read or PID-verification failure. | [healthcheck](test/healthcheck.test.mjs) |
 
-The former systemd deployment findings were resolved by removing project-owned
-Host setup. The plugin now provides only an optional, operator-configured
-[systemd example](examples/systemd/dsh-host.service):
-
-- **11. P1 — Fresh systemd installation can fail before workspace creation:** the
-  operator must create the configured workspace before enabling the example.
-- **12. P2 — The systemd unit assumes a particular checkout location:** the
-  example uses an operator-selected workspace rather than a checkout path.
-- **13. P2 — The installer accepts a DSH executable the unit cannot launch:** no
-  installer remains; the operator must configure the absolute DSH and Node paths.
+Former Host-deployment findings **11–13 and 21** are retired: Host setup examples
+and their example-only healthcheck tests have been removed. This repository
+provides a DSH plugin, not Host deployment or process supervision.
 
 ## Remaining limitations
 
@@ -59,11 +51,12 @@ Host setup. The plugin now provides only an optional, operator-configured
 
 ## Validation and scope
 
-- Working-tree fixes for issues 19–21 on 2026-11-06: all **232 offline tests** passed, plus `npm run check`, explicit syntax checks of the changed source modules and healthcheck script, and `git diff --check`. Native macOS identity probes were checked across processes with differing locale/timezone settings. Linux `/proc` parsing used injected fixtures; PID reuse and boot changes were simulated. Coverage also includes five-contender generation takeovers, deadline-bound QR fetch/acknowledgement cancellation, late confirmation, and healthcheck corruption/process-check failures. No native Linux kernel, live WeChat account, DSH Host, Docker deployment, or systemd service was exercised.
+- After removing Host setup examples and their 32 example-only tests on 2026-11-06: all **200 remaining offline plugin tests** passed, plus `npm run check` and `git diff --check`. Plugin runtime code is unchanged; no live WeChat account or DSH Host was exercised.
+- Fixes for issues 19–21 in `9d6331d` on 2026-11-06: all **232 offline tests** passed, including 32 checks for the now-removed Host healthcheck example, plus `npm run check`, explicit syntax checks of the changed modules, and `git diff --check`. Native macOS identity probes were checked across processes with differing locale/timezone settings. Linux `/proc` parsing used injected fixtures; PID reuse and boot changes were simulated. Plugin coverage also includes five-contender generation takeovers, deadline-bound QR fetch/acknowledgement cancellation, and late confirmation. No native Linux kernel, live WeChat account, or DSH Host was exercised.
 - Fixes for issues 17 and 18 in `def3f4e` on 2026-11-06: all **154 offline tests** passed, plus `npm run check`, explicit syntax checks of the changed source modules, and `git diff --check`. Coverage includes forced account replacement, logout without fallback, missing/corrupt selection, failed selection writes, and failed state writes with same-value retries and concurrent callers. No live WeChat account or DSH Host was exercised.
 - Review of `1497dc2` on 2026-11-06: all **137 offline tests** passed, along with `npm run check` and `git diff --check`. A production dependency audit through the official npm registry reported zero vulnerabilities; the configured mirror did not support the audit endpoint.
-- All eight new findings were independently reproduced using injected transports or cleaned-up disposable fixtures. PID reuse was simulated, not triggered through OS PID recycling. No live WeChat account, live DSH integration, Docker deployment, or Linux systemd execution was exercised; the Docker healthcheck script was run locally.
+- All eight new findings were independently reproduced using injected transports or cleaned-up disposable fixtures. PID reuse was simulated, not triggered through OS PID recycling. No live WeChat account or live DSH integration was exercised; the former Host healthcheck script was run locally.
 - Before committing `8d77e08`, all **137 offline tests** passed in three consecutive runs, plus `npm run check` and `git diff --check`.
 - Each run included 100 fresh and 100 stale lock trials with five contenders, plus separate-process contention for both cases. This is regression evidence, not proof of every schedule or filesystem behavior.
-- Tests used macOS, fake Host/client interfaces, temporary files, loopback HTTP, child processes, and offline readline streams. Only disposable fixture accounts were logged out; no live WeChat account, Docker Host example, or Linux systemd execution was tested.
+- Tests used macOS, fake Host/client interfaces, temporary files, loopback HTTP, child processes, and offline readline streams. Only disposable fixture accounts were logged out; no live WeChat account or Host deployment was tested.
 - The initial npm audit at `0f798c1` reported zero known dependency vulnerabilities; dependency manifests remain unchanged. This is not an exhaustive security assessment.

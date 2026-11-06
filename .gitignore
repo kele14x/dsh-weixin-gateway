@@ -17,7 +17,6 @@ coverage/
 .env
 .env.*
 !.env.example
-/examples/docker/.state/
 
 # Logs and OS metadata
 *.log
