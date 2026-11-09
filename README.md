@@ -1,30 +1,20 @@
 # dsh-weixin-gateway
 
-A native **DeepSeek Harness (DSH) / Cordis** plugin that connects a DSH agent to
-WeChat direct messages — without OpenClaw, without a public IP, and without an
-inbound port.
-
-```
-WeChat / ClawBot  →  Tencent iLink Bot API  →  this plugin (inside the DSH Host)
-                                                     ↓
-                                       Session Controller → agent, tools, workspace
-```
-
-All WeChat traffic is outbound HTTPS: QR login, one long poll for messages, and
-outbound sends. There is no webhook, no callback, and nothing to expose.
+A native **DeepSeek Harness (DSH) / Cordis** plugin that lets you chat with your
+DSH agent directly from WeChat. Message the bot from your phone and it talks to
+the same agent, tools, and workspace you use on the desktop.
 
 This package runs inside the DSH Host; it is not a standalone service. Host
 installation, deployment, and process supervision are managed by the operator.
 
 ## What it does
 
-- QR login; credentials live under `$DSH_HOME/integrations/dsh-weixin/`.
-- One DSH session per WeChat sender, persisted across restarts. `/new` starts a
-  fresh session and keeps the old history.
-- Default-deny sender allowlist; pair a chat with a one-time `/bind` code.
-- Replies are chunked Unicode-safe under `maxMessageChars`.
-- Exactly one poller per bot token, enforced by a local lock. A second Host on
-  the same machine waits and takes over when the first exits.
+- Scan a QR code once to connect your WeChat account.
+- Each WeChat chat gets its own conversation with the agent, and it resumes where
+  you left off after a restart. Send `/new` to start over; the old history is kept.
+- Only chats you approve can reach the agent. Pair a chat once with a code.
+- Long replies arrive as several readable messages instead of being cut off.
+- A typing indicator shows while the agent is working on your message.
 
 ## Requirements
 
@@ -87,49 +77,25 @@ Anything else is sent to the agent as a prompt.
 
 ## Configuration
 
-Set on the plugin row. `stateDir` is required and must be absolute.
-`defaultCwd` is optional: empty (the default) uses the plugin's own `workspace/`
-directory, and `DSH_WEIXIN_CWD` overrides it.
+Most people need no configuration: the install supplies `stateDir`, and sessions
+default to the plugin's own `workspace/` directory. Set `DSH_WEIXIN_CWD` to run
+sessions from a different directory.
 
-| Key | Default | Purpose |
-|---|---|---|
-| `stateDir` | — | credentials, cursor, allowlist, lock |
-| `defaultCwd` | `<plugin>/workspace` | workspace for new sessions |
-| `agentPreset` | — | preset for new sessions |
-| `maxMessageChars` | `1800` | outbound chunk size |
-| `bindCodeEnv` | `DSH_WEIXIN_BIND_CODE` | pairing-code variable |
-| `replyMode` | `all` | send `all` steps or only the `last` |
-| `logLevel` | `info` | log threshold |
-| `debugLogContent` | `false` | allow raw text in debug logs |
-
-Queue size, timeouts, and backoff are in `src/config.mjs`.
+The pairing code is read from the `DSH_WEIXIN_BIND_CODE` environment variable
+(rename it with `bindCodeEnv`). The full list of settings — reply chunking,
+queue size, timeouts, logging — is documented in `AGENTS.md`; the authoritative
+schema is `src/config.mjs`.
 
 ## Security
 
-- Unknown senders are denied until `/bind`; failed attempts are rate limited.
-- Tokens, context tokens, QR URLs, and message text are redacted from logs.
-- Credential and state files are `0600`, directories `0700`.
+- Only chats you pair with `/bind` can reach the agent; everyone else is refused,
+  and repeated wrong codes are rate limited.
+- Message text never appears in logs unless you explicitly turn on
+  `debugLogContent`.
 - Keep the DSH sandbox at `workspace-write`.
 
-## Failure handling
-
-- `-14`: one poller per bot token. The gateway pauses for the documented hour and
-  logs a concrete diagnostic; the lock heartbeat keeps running through the pause.
-- A second Host on the same machine refuses to
-  poll, then retries every 30 s and adopts the account as soon as the first owner
-  exits. Taking over a stale lock is atomic, so two starters cannot both claim it.
-- Local lock recovery compares boot identity and process start time on Linux and
-  macOS to detect a reused PID. Matching or unverifiable live owners stay
-  protected regardless of heartbeat age; older locks without generation metadata
-  may still need operator inspection.
-- Long-poll or network errors: backoff, cursor kept.
-- Send errors: one retry on a plain network failure, reusing the message ID as a
-  server-side deduplication hint, then log; never claims success.
-- QR login: HTTP requests use the remaining overall login budget, capped by the
-  client's shorter request timeout; credentials arriving after the deadline are
-  rejected.
-- Turn timeout or a missing session: an actionable reply, never a fabricated
-  answer.
+Implementation details — credential file permissions, log redaction, the
+single-poller lock, retry/backoff, and `-14` handling — are in `AGENTS.md`.
 
 ## Tests
 
