@@ -9,6 +9,7 @@
  */
 
 import { timingSafeEqual } from 'node:crypto'
+import { matchesPairingCode, normalizePairingCode, readPairingCode } from '../store/pairing.mjs'
 import { silentLogger } from '../util/log.mjs'
 
 const COMMAND_PATTERN = /^[a-z][a-z0-9-]*$/
@@ -131,9 +132,11 @@ export class CommandRouter {
     if (this.allowed.isAllowed(userId)) return 'This chat is already paired.'
 
     const envName = this.config.bindCodeEnv
-    const expected = envName ? process.env[envName] : undefined
-    if (typeof expected !== 'string' || expected.length === 0) {
-      return `Pairing is disabled: the operator has not set ${envName || 'the pairing code environment variable'}.`
+    const envCode = envName ? process.env[envName] : undefined
+    const hasEnvCode = typeof envCode === 'string' && envCode.length > 0
+    const issued = await this.#activeIssuedCode()
+    if (!hasEnvCode && issued === null) {
+      return 'Pairing is not open. Ask the operator to run "dsh-weixin pair" and send you the code.'
     }
 
     if (this.#tooManyFailures(userId)) {
@@ -145,19 +148,45 @@ export class CommandRouter {
       return 'Usage: /bind <code>'
     }
 
-    if (!safeEqual(candidate, expected)) {
+    let code
+    let fromEnv = false
+    if (issued !== null && matchesPairingCode(normalizePairingCode(candidate), issued.codeHash)) {
+      code = normalizePairingCode(candidate)
+    } else if (hasEnvCode && safeEqual(candidate, envCode)) {
+      code = candidate
+      fromEnv = true
+    } else {
       this.#recordFailure(userId)
       this.logger.warn('rejected pairing attempt', { userId })
       return 'That pairing code is not valid.'
     }
 
-    if (!(await this.allowed.redeem(userId, candidate))) {
+    if (!(await this.allowed.redeem(userId, code))) {
       if (this.allowed.isAllowed(userId)) return 'This chat is already paired.'
-      return `That pairing code has already been redeemed. Ask the operator to set a different code in ${envName} and share the new code.`
+      if (fromEnv) {
+        return `That pairing code has already been redeemed. Ask the operator to set a different code in ${envName} and share the new code.`
+      }
+      return 'That pairing code has already been redeemed. Ask the operator to run "dsh-weixin pair" for a new code.'
     }
     this.bindFailures.delete(userId)
     this.logger.info('paired a WeChat sender', { userId })
     return 'Paired. Send a message to talk to the agent, or /help for commands.'
+  }
+
+  /**
+   * @returns {Promise<{codeHash: string, expiresAt: number}|null>} the unexpired operator-issued code.
+   */
+  async #activeIssuedCode() {
+    if (typeof this.config.stateDir !== 'string') return null
+    let issued
+    try {
+      issued = await readPairingCode(this.config.stateDir)
+    } catch (error) {
+      this.logger.warn('ignoring unreadable pairing code file', { error: error.message })
+      return null
+    }
+    if (issued === null || issued.expiresAt <= Date.now()) return null
+    return issued
   }
 
   /**

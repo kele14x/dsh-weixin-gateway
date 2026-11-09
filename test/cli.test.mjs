@@ -6,10 +6,13 @@ import { mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { createInterface } from 'node:readline/promises'
 import { PassThrough } from 'node:stream'
 import { createLoginIo, main, parseArgs } from '../bin/dsh-weixin.mjs'
+import { CommandRouter } from '../src/bridge/commands.mjs'
 import { LoginError, runQrLogin } from '../src/ilink/auth.mjs'
 import { ILinkClient } from '../src/ilink/client.mjs'
 import { AccountStore, safeBotId } from '../src/store/accounts.mjs'
 import { ChannelState } from '../src/store/state.mjs'
+import { AllowList } from '../src/store/allowed.mjs'
+import { pairingFile } from '../src/store/pairing.mjs'
 import { acquireLock } from '../src/store/lock.mjs'
 import { makeTempDir, cleanup } from './helpers/tmp.mjs'
 
@@ -228,3 +231,62 @@ for (const reason of ['timeout', 'aborted']) {
     t.mock.timers.tick(1000)
   })
 }
+
+test('pair issues a code that status tracks and logout clears', async (t) => {
+  const output = captureOutput(t)
+  const stateDir = await makeTempDir('cli-pair')
+  t.after(() => cleanup(stateDir))
+  await storeFixture(stateDir)
+
+  assert.equal(await main(['status', '--state-dir', stateDir]), 0)
+  assert.ok(output.logs.some((line) => /pairing:\s+no code issued/.test(line)))
+
+  assert.deepEqual(parseArgs(['pair', '--state-dir', stateDir]).command, 'pair')
+  assert.equal(await main(['pair', '--state-dir', stateDir]), 0)
+  const code = output.logs.find((line) => line.startsWith('Pairing code: ')).slice('Pairing code: '.length)
+  assert.match(code, /^[a-hj-km-np-z2-9]{8}$/)
+  assert.ok(output.logs.some((line) => line.includes(`/bind ${code}`)))
+
+  output.logs.length = 0
+  assert.equal(await main(['status', '--state-dir', stateDir]), 0)
+  assert.ok(output.logs.some((line) => /pairing:\s+code pending until/.test(line)))
+  assert.equal(output.logs.some((line) => line.includes(code)), false)
+
+  const allowed = new AllowList({ stateDir })
+  await allowed.load()
+  assert.equal(await allowed.redeem('sender-2', code), true)
+  output.logs.length = 0
+  assert.equal(await main(['status', '--state-dir', stateDir]), 0)
+  assert.ok(output.logs.some((line) => /pairing:\s+last code redeemed/.test(line)))
+
+  assert.equal(await main(['logout', '--state-dir', stateDir, '--yes']), 0)
+  await assert.rejects(() => readFile(pairingFile(stateDir)), { code: 'ENOENT' })
+})
+
+test('logout without an active account clears pending codes before a subsequent login', async (t) => {
+  const output = captureOutput(t)
+  const stateDir = await makeTempDir('cli-pair-without-account')
+  t.after(() => cleanup(stateDir))
+  const accounts = new AccountStore({ stateDir })
+  assert.equal(await accounts.active(), null)
+
+  assert.equal(await main(['pair', '--state-dir', stateDir]), 0)
+  const code = output.logs.find((line) => line.startsWith('Pairing code: ')).slice('Pairing code: '.length)
+  await stat(pairingFile(stateDir))
+
+  assert.equal(await main(['logout', '--state-dir', stateDir, '--yes']), 0)
+  await assert.rejects(() => readFile(pairingFile(stateDir)), { code: 'ENOENT' })
+  assert.equal(await main(['logout', '--state-dir', stateDir, '--yes']), 0)
+
+  await accounts.save({ botId: 'bot-1', botToken: 'private-token', baseUrl: 'https://api.test' })
+  const allowed = new AllowList({ stateDir })
+  await allowed.load()
+  const router = new CommandRouter({ actions: {}, allowed, config: { stateDir, bindCodeEnv: '' } })
+  const outcome = await router.handle({
+    userId: 'sender',
+    command: { name: 'bind', args: [code] },
+    isAllowed: false,
+  })
+  assert.match(outcome.reply, /not open/)
+  assert.equal(allowed.isAllowed('sender'), false)
+})

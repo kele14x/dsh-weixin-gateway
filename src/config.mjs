@@ -84,7 +84,9 @@ export const Config = z.object({
   bindCodeEnv: z
     .string()
     .default('DSH_WEIXIN_BIND_CODE')
-    .description('Environment variable holding the one-time /bind code. Empty disables pairing.'),
+    .description(
+      'Environment variable holding an optional /bind code. Empty disables it; codes from "dsh-weixin pair" still work.',
+    ),
   replyMode: z
     .union([z.const('all'), z.const('last')])
     .default('all')

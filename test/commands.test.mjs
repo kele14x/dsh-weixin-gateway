@@ -1,8 +1,18 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { readFile, stat, writeFile } from 'node:fs/promises'
 import { CommandRouter, HELP_TEXT, parseCommand, safeEqual } from '../src/bridge/commands.mjs'
 import { AllowList } from '../src/store/allowed.mjs'
+import { issuePairingCode, pairingFile } from '../src/store/pairing.mjs'
 import { makeTempDir, cleanup } from './helpers/tmp.mjs'
+
+function withoutEnvCode(t) {
+  const previous = process.env.DSH_WEIXIN_BIND_CODE
+  delete process.env.DSH_WEIXIN_BIND_CODE
+  t.after(() => {
+    if (previous !== undefined) process.env.DSH_WEIXIN_BIND_CODE = previous
+  })
+}
 
 async function makeRouter(t, { allowed = false, actions = {}, stateDir } = {}) {
   const dir = stateDir ?? await makeTempDir('commands')
@@ -19,7 +29,7 @@ async function makeRouter(t, { allowed = false, actions = {}, stateDir } = {}) {
       ...actions,
     },
     allowed: allowList,
-    config: { bindCodeEnv: 'DSH_WEIXIN_BIND_CODE' },
+    config: { bindCodeEnv: 'DSH_WEIXIN_BIND_CODE', stateDir: dir },
   })
   return { router, allowList, stateDir: dir }
 }
@@ -80,7 +90,7 @@ test('a wrong pairing code does not grant access', async (t) => {
   assert.match(valid.reply, /^Paired\./)
 })
 
-test('pairing is disabled when the environment variable is unset', async (t) => {
+test('pairing is not open when no code is issued and the environment variable is unset', async (t) => {
   const previous = process.env.DSH_WEIXIN_BIND_CODE
   delete process.env.DSH_WEIXIN_BIND_CODE
   t.after(() => {
@@ -93,7 +103,7 @@ test('pairing is disabled when the environment variable is unset', async (t) => 
     command: { name: 'bind', args: ['anything'] },
     isAllowed: false,
   })
-  assert.match(outcome.reply, /disabled/)
+  assert.match(outcome.reply, /not open.*dsh-weixin pair/)
 })
 
 test('repeated wrong codes are rate limited', async (t) => {
@@ -195,4 +205,59 @@ test('bind rejects consumed codes after restart and accepts a distinct rotated c
   const restarted = await makeRouter(t, { stateDir })
   assert.match((await bind(restarted.router, 'u3', 'original-code')).reply, /already been redeemed/)
   assert.equal(restarted.allowList.isAllowed('u3'), false)
+})
+
+const bind = (router, userId, code) => router.handle({
+  userId,
+  command: { name: 'bind', args: [code] },
+  isAllowed: false,
+})
+
+test('an issued code pairs without the environment variable or a restart and is single use', async (t) => {
+  withoutEnvCode(t)
+  const { router, allowList, stateDir } = await makeRouter(t)
+  assert.match((await bind(router, 'u1', 'whatever')).reply, /not open/)
+
+  const first = await issuePairingCode(stateDir)
+  assert.match(first.code, /^[a-hj-km-np-z2-9]{8}$/)
+  assert.match((await bind(router, 'u1', first.code.toUpperCase())).reply, /^Paired\./)
+  assert.equal(allowList.isAllowed('u1'), true)
+
+  const replay = (await bind(router, 'u2', first.code)).reply
+  assert.match(replay, /already been redeemed.*dsh-weixin pair/)
+  assert.equal(allowList.isAllowed('u2'), false)
+
+  const second = await issuePairingCode(stateDir)
+  assert.match((await bind(router, 'u2', first.code)).reply, /not valid/)
+  assert.match((await bind(router, 'u2', second.code)).reply, /^Paired\./)
+})
+
+test('an expired issued code is refused while the environment code still works', async (t) => {
+  const previous = process.env.DSH_WEIXIN_BIND_CODE
+  t.after(() => {
+    if (previous === undefined) delete process.env.DSH_WEIXIN_BIND_CODE
+    else process.env.DSH_WEIXIN_BIND_CODE = previous
+  })
+  delete process.env.DSH_WEIXIN_BIND_CODE
+
+  const { router, allowList, stateDir } = await makeRouter(t)
+  const { code } = await issuePairingCode(stateDir, { now: Date.now() - 60_000, ttlMs: 1_000 })
+  assert.match((await bind(router, 'u1', code)).reply, /not open/)
+  assert.equal(allowList.isAllowed('u1'), false)
+
+  process.env.DSH_WEIXIN_BIND_CODE = 'env-code'
+  assert.match((await bind(router, 'u1', code)).reply, /not valid/)
+  assert.match((await bind(router, 'u1', 'env-code')).reply, /^Paired\./)
+})
+
+test('an issued code is stored only as an owner-only hash and a corrupt file is ignored', async (t) => {
+  withoutEnvCode(t)
+  const { router, stateDir } = await makeRouter(t)
+  const { code } = await issuePairingCode(stateDir)
+  const file = pairingFile(stateDir)
+  assert.equal((await stat(file)).mode & 0o777, 0o600)
+  assert.equal((await readFile(file, 'utf8')).includes(code), false)
+
+  await writeFile(file, '{not json')
+  assert.match((await bind(router, 'u1', code)).reply, /not open/)
 })

@@ -18,6 +18,7 @@ import { AccountStore, maskToken, safeBotId } from '../src/store/accounts.mjs'
 import { acquireLock, LockError } from '../src/store/lock.mjs'
 import { ChannelState } from '../src/store/state.mjs'
 import { AllowList } from '../src/store/allowed.mjs'
+import { clearPairingCode, issuePairingCode, readPairingCode } from '../src/store/pairing.mjs'
 import { ILinkClient } from '../src/ilink/client.mjs'
 import { LoginError, runQrLogin } from '../src/ilink/auth.mjs'
 import { VERSION, botAgentFor } from '../src/ilink/constants.mjs'
@@ -26,6 +27,7 @@ const USAGE = `dsh-weixin ${VERSION}
 
 Usage:
   dsh-weixin login   [--state-dir <path>] [--base-url <url>] [--force] [--no-qr] [--show-url]
+  dsh-weixin pair    [--state-dir <path>]
   dsh-weixin status  [--state-dir <path>]
   dsh-weixin logout  [--state-dir <path>] [--yes]
 
@@ -33,8 +35,10 @@ State directory defaults to $DSH_HOME/integrations/dsh-weixin, or
 ~/.dsh/integrations/dsh-weixin when DSH_HOME is unset.
 
 login scans a QR code and stores bot credentials (mode 0600).
+pair prints a one-time /bind code valid for 15 minutes; the running gateway
+accepts it without a restart, and running pair again replaces it.
 status prints accounts and cursor/session counts; it never prints tokens.
-logout removes the stored account, its state, and its allowlist.`
+logout removes the stored account, its state, its allowlist, and any pending code.`
 
 /**
  * Parse argv into a command and flags.
@@ -183,8 +187,8 @@ async function login(options, accounts) {
     console.log(`  owner:    ${credentials.ownerUserId ?? '(unknown)'}`)
     console.log(`  stored:   ${path}`)
     console.log('')
-    console.log('Next: start the DSH Host (dsh web). Then send the bot a direct message;')
-    console.log('pair the chat with /bind <code> using the code from DSH_WEIXIN_BIND_CODE.')
+    console.log('Next: start the DSH Host (dsh web), run "dsh-weixin pair" for a pairing code,')
+    console.log('then send the bot a direct message: /bind <code>.')
     return 0
   } catch (error) {
     if (error instanceof LoginError) {
@@ -196,6 +200,43 @@ async function login(options, accounts) {
   } finally {
     readline.close()
   }
+}
+
+/**
+ * `dsh-weixin pair`.
+ *
+ * @param {string} stateDir - state directory.
+ * @returns {Promise<number>} exit code.
+ */
+async function pair(stateDir) {
+  const { code, expiresAt } = await issuePairingCode(stateDir)
+  console.log(`Pairing code: ${code}`)
+  console.log(`Expires:      ${new Date(expiresAt).toLocaleString()} (single use)`)
+  console.log('')
+  console.log(`Send this to the bot from WeChat:  /bind ${code}`)
+  console.log('The running gateway accepts it immediately; no restart is needed.')
+  console.log('Running pair again replaces this code.')
+  return 0
+}
+
+/**
+ * Describe the pending pairing code without revealing it.
+ *
+ * @param {string} stateDir - state directory.
+ * @param {AllowList} allowed - loaded allowlist.
+ * @returns {Promise<string>} one-line description.
+ */
+async function pairingSummary(stateDir, allowed) {
+  let issued
+  try {
+    issued = await readPairingCode(stateDir)
+  } catch (error) {
+    return `unreadable (${error.message})`
+  }
+  if (issued === null) return 'no code issued (run: dsh-weixin pair)'
+  if (allowed.hasConsumed(issued.codeHash)) return 'last code redeemed (run pair for another)'
+  if (issued.expiresAt <= Date.now()) return 'last code expired (run pair for another)'
+  return `code pending until ${new Date(issued.expiresAt).toLocaleString()}`
 }
 
 /**
@@ -215,6 +256,11 @@ async function status(options, stateDir, accounts) {
 
   const active = await accounts.active()
   console.log(`active account: ${active?.botId ?? '(none)'}`)
+  const allowed = new AllowList({ stateDir })
+  await allowed.load()
+  console.log(`pairing:        ${await pairingSummary(stateDir, allowed)}`)
+  console.log(`paired:         ${allowed.size} sender(s)`)
+  console.log('')
   for (const record of records) {
     console.log(`account: ${record.botId}`)
     console.log(`  token:    ${maskToken(record.botToken)}`)
@@ -232,10 +278,6 @@ async function status(options, stateDir, accounts) {
     } catch (error) {
       console.log(`  state:    unreadable (${error.message})`)
     }
-
-    const allowed = new AllowList({ stateDir })
-    await allowed.load()
-    console.log(`  paired:   ${allowed.size} sender(s)`)
 
     const lockPath = join(stateDir, 'lock', `${safeBotId(record.botId)}.lock`)
     console.log(`  lock:     ${existsSync(lockPath) ? 'held' : 'free'}`)
@@ -255,7 +297,8 @@ async function status(options, stateDir, accounts) {
 async function logout(options, stateDir, accounts) {
   const record = await accounts.active()
   if (record === null) {
-    console.log('No WeChat account to remove.')
+    await clearPairingCode(stateDir)
+    console.log('No WeChat account to remove. Any pending pairing code has been cleared.')
     return 0
   }
 
@@ -284,6 +327,7 @@ async function logout(options, stateDir, accounts) {
     await state.load().catch(() => {})
     await rm(state.file, { force: true })
     await rm(join(stateDir, 'allowed.json'), { force: true })
+    await clearPairingCode(stateDir)
 
     console.log(`Removed ${record.botId}.`)
     return 0
@@ -320,6 +364,8 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
   switch (options.command) {
     case 'login':
       return login(options, accounts)
+    case 'pair':
+      return pair(stateDir)
     case 'status':
       return status(options, stateDir, accounts)
     case 'logout':

@@ -63,9 +63,15 @@ Phase 1 covers inbound images only:
 
 ## Security internals
 
-- Default-deny allowlist: a sender must redeem the one-time `/bind` code before
+- Default-deny allowlist: a sender must redeem a one-time `/bind` code before
   any message reaches the agent. Redemption is atomic and records a consumed-code
   fingerprint, so a code cannot be replayed and a failed write grants no access.
+- Codes come from `dsh-weixin pair` or the `bindCodeEnv` variable. `pair` writes
+  `<stateDir>/pairing.json` holding only the code's SHA-256 (the same value as
+  the consumed fingerprint) and a 15-minute expiry; `/bind` rereads it on every
+  attempt, so issuing or rotating a code needs no restart. Generated codes are
+  8 lowercase characters without look-alikes and compare case-insensitively.
+  An unreadable `pairing.json` is logged and treated as absent; `logout` removes it.
 - `/bind` failures are rate limited (5 per hour per sender) and the code is
   compared with `timingSafeEqual`, so it cannot be brute-forced from WeChat.
 - Tokens, context tokens, QR URLs, media AES keys, CDN query parameters, and
@@ -85,7 +91,7 @@ optional: empty (the default) uses the plugin's own `workspace/` directory, and
 
 | Key | Default | Purpose |
 |---|---|---|
-| `stateDir` | — | credentials, cursor, allowlist, lock |
+| `stateDir` | — | credentials, cursor, allowlist, pairing code, lock |
 | `defaultCwd` | `<plugin>/workspace` | workspace for new sessions |
 | `agentPreset` | — | preset for new sessions |
 | `baseUrl` | iLink default | API origin; a QR redirect may override it per account |
@@ -99,7 +105,7 @@ optional: empty (the default) uses the plugin's own `workspace/` directory, and
 | `pollTimeoutMs` | iLink default | long-poll budget; the server value wins when present |
 | `queueLimit` | `8` | max queued inbound messages per sender |
 | `turnTimeoutMs` | `600000` | how long to wait for one DSH turn |
-| `bindCodeEnv` | `DSH_WEIXIN_BIND_CODE` | pairing-code variable; empty disables pairing |
+| `bindCodeEnv` | `DSH_WEIXIN_BIND_CODE` | optional fixed pairing-code variable; empty disables it (`pair` codes still work) |
 | `replyMode` | `all` | send `all` steps or only the `last` |
 | `sessionPauseMs` | iLink default | pause after a `-14` response |
 | `logLevel` | `info` | log threshold |
@@ -112,7 +118,7 @@ defaults live there and in `src/ilink/constants.mjs`.
 ## Tests
 
 ```sh
-npm test        # 232 offline tests
+npm test        # offline tests
 npm run check   # syntax check of the entry points
 ```
 

@@ -6,18 +6,7 @@ Priority: **P1** denotes a high-priority reliability or access-control defect; *
 
 ## Open issues
 
-- **22. P3 — Pairing requires a manually exported environment variable**
-  `/bind` reads the pairing code only from `process.env[config.bindCodeEnv]`
-  (`src/bridge/commands.mjs`). When the variable is unset or empty, every `/bind`
-  is refused with "Pairing is disabled" and no chat can reach the agent. The
-  operator must choose a code, `export DSH_WEIXIN_BIND_CODE=...` in the Host
-  environment, and restart the Host — the CLI (`login`/`status`/`logout`) offers
-  no way to generate, set, or rotate the code. This is a poor first-run
-  experience. Consider a `dsh-weixin bind-code` (or `pair`) subcommand that
-  generates and persists a one-time code under `stateDir`, so pairing needs no
-  environment edit or Host restart.
-
-No other open findings from the recorded reviews remain. The remaining limitations below still apply.
+No open findings from the recorded reviews remain. The remaining limitations below still apply.
 
 ## Fixed issues
 
@@ -88,6 +77,15 @@ The following fixes followed separately and are also covered by offline regressi
   Resolution: cap QR HTTP requests at the remaining overall budget and the shorter
   client timeout; reject late responses and credentials.
   Coverage: [auth](test/auth.test.mjs), [client](test/client.test.mjs)
+- **22. P3 — Pairing requires a manually exported environment variable**
+  Resolution: `dsh-weixin pair` issues a single-use code with a 15-minute expiry
+  and stores only its hash in `<stateDir>/pairing.json`. `/bind` rereads it on
+  every attempt, so pairing needs no environment edit or Host restart. `status`
+  reports whether a code is pending, expired, or redeemed; `logout` clears it,
+  including when no account is active.
+  The `bindCodeEnv` code remains an optional fallback.
+  Coverage: [commands](test/commands.test.mjs), [CLI](test/cli.test.mjs),
+  [gateway](test/gateway.test.mjs)
 
 Former Host-deployment findings **11–13 and 21** are retired: Host setup examples
 and their example-only healthcheck tests have been removed. This repository
@@ -101,11 +99,12 @@ provides a DSH plugin, not Host deployment or process supervision.
 - **Shutdown deadline:** Uncancellable session creation/persistence or admission that never settles can block shutdown indefinitely.
 - **Process identity:** Generation probes use Linux `/proc` boot IDs and start ticks, or macOS boot-session UUIDs and locale/timezone-normalized `ps` start timestamps. macOS timestamps have one-second resolution, so same-second PID reuse may remain indistinguishable. Missing metadata, unavailable probes, and unsupported platforms conservatively retain a live PID's lock; older abandoned locks may still require operator inspection.
 - **Coordination scope:** The advisory lock protects one local host/container, not cross-host replicas. Pairing redemption is serialized within one allowlist writer and across reloads, not independent writers sharing a file.
-- **Pairing rotation:** Codes consumed before the fix cannot be reconstructed. Rotate the existing code when deploying; replacement requires a distinct value in the configured `bindCodeEnv` variable in the Host environment, normally by restarting Host with the updated environment. Revocation does not reactivate a consumed code.
+- **Pairing rotation:** Codes consumed before the fix cannot be reconstructed. Rotate the existing code when deploying. `dsh-weixin pair` issues a fresh code without a restart; a code in the `bindCodeEnv` variable still needs a distinct value and, normally, a Host restart. Revocation does not reactivate a consumed code. Issued codes live in one file per `stateDir`, so only the latest `pair` code is valid.
 
 ## Validation and scope
 
 - After adding inbound image support: all **232 offline plugin tests** passed, plus `npm run check` and `git diff --check`. Media tests cover AES key encodings, AES-128-ECB round trips, CDN URL construction, byte caps, host allowlisting, image magic-byte sniffing, lossless uint64 ids, and the gateway image prompt/failure paths. No live WeChat account, CDN, or DSH Host was exercised.
+- Fix for issue 22: all **206 offline tests** passed, plus `npm run check` and `git diff --check`. Coverage includes clearing accountless pairing codes on logout and rejecting them after a subsequent login. `pair` and `status` were also run manually against a scratch state directory. No live WeChat account or DSH Host was exercised.
 - After removing Host setup examples and their 32 example-only tests: all **200 remaining offline plugin tests** passed, plus `npm run check` and `git diff --check`. Plugin runtime code is unchanged; no live WeChat account or DSH Host was exercised.
 - Fixes for issues 19–21 in `9d6331d`: all **232 offline tests** passed, including 32 checks for the now-removed Host healthcheck example, plus `npm run check`, explicit syntax checks of the changed modules, and `git diff --check`. Native macOS identity probes were checked across processes with differing locale/timezone settings. Linux `/proc` parsing used injected fixtures; PID reuse and boot changes were simulated. Plugin coverage also includes five-contender generation takeovers, deadline-bound QR fetch/acknowledgement cancellation, and late confirmation. No native Linux kernel, live WeChat account, or DSH Host was exercised.
 - Fixes for issues 17 and 18 in `def3f4e`: all **154 offline tests** passed, plus `npm run check`, explicit syntax checks of the changed source modules, and `git diff --check`. Coverage includes forced account replacement, logout without fallback, missing/corrupt selection, failed selection writes, and failed state writes with same-value retries and concurrent callers. No live WeChat account or DSH Host was exercised.

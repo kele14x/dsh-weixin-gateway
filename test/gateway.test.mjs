@@ -6,6 +6,7 @@ import { setTimeout as delay } from 'node:timers/promises'
 import { Gateway } from '../src/runtime.mjs'
 import { AccountStore } from '../src/store/accounts.mjs'
 import { AllowList } from '../src/store/allowed.mjs'
+import { issuePairingCode } from '../src/store/pairing.mjs'
 import { ChannelState } from '../src/store/state.mjs'
 import { acquireLock, LockError } from '../src/store/lock.mjs'
 import { createLogger } from '../src/util/log.mjs'
@@ -857,4 +858,23 @@ test('a corrupt state file fails startup instead of dropping session mappings', 
 
   await assert.rejects(() => gateway.start(), /not valid JSON/)
   assert.equal(gateway.status, 'error')
+})
+
+test('a code issued while the gateway runs pairs a sender without a restart', async (t) => {
+  const previous = process.env.DSH_WEIXIN_BIND_CODE
+  delete process.env.DSH_WEIXIN_BIND_CODE
+  t.after(() => {
+    if (previous !== undefined) process.env.DSH_WEIXIN_BIND_CODE = previous
+  })
+
+  const { client, gateway, dir } = await setup(t, { allowed: false })
+  await gateway.start()
+  client.push({ msgs: [textMessage({ id: 1, from: 'u2', text: '/bind early' })] })
+  await waitFor(() => client.sent.length === 1, { message: 'not-open reply' })
+  assert.match(client.sent[0].text, /not open/)
+
+  const { code } = await issuePairingCode(dir)
+  client.push({ msgs: [textMessage({ id: 2, from: 'u2', text: `/bind ${code}` })] })
+  await waitFor(() => client.sent.length === 2, { message: 'bind reply' })
+  assert.match(client.sent[1].text, /^Paired\./)
 })

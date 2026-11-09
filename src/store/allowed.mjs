@@ -8,9 +8,9 @@
  * @module dsh-weixin-gateway/store/allowed
  */
 
-import { createHash } from 'node:crypto'
 import { join } from 'node:path'
 import { readJson, writeJsonAtomic } from './atomic.mjs'
+import { codeFingerprint } from './pairing.mjs'
 
 /** Sender allowlist rooted at `<stateDir>/allowed.json`. */
 export class AllowList {
@@ -71,9 +71,19 @@ export class AllowList {
     })
   }
 
+  /**
+   * Whether a code with this fingerprint has been redeemed.
+   *
+   * @param {string} fingerprint - hex SHA-256 of the code.
+   * @returns {boolean} true when consumed.
+   */
+  hasConsumed(fingerprint) {
+    return this.#consumedCodeHashes.has(fingerprint)
+  }
+
   async redeem(userId, code) {
     if (typeof code !== 'string' || code.length === 0) return false
-    const fingerprint = createHash('sha256').update(code, 'utf8').digest('hex')
+    const fingerprint = codeFingerprint(code)
     return this.#enqueue(async () => {
       if (this.users.has(userId) || this.#consumedCodeHashes.has(fingerprint)) return false
       const users = new Map(this.users)

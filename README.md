@@ -45,11 +45,13 @@ launch from.
 
 ```sh
 node bin/dsh-weixin.mjs login          # scan the QR with WeChat
-export DSH_WEIXIN_BIND_CODE='choose-a-code'
 dsh web
+node bin/dsh-weixin.mjs pair           # prints a one-time code, e.g. k7m3pq9x
 ```
 
-Then send the bot a direct message and reply `/bind choose-a-code`.
+Then send the bot a direct message and reply `/bind k7m3pq9x`. The code works
+once and expires after 15 minutes; run `pair` again for each chat you want to
+pair. The running Host picks it up immediately, so no restart is needed.
 
 `node bin/dsh-weixin.mjs status` and `node bin/dsh-weixin.mjs logout` are also
 available; `login` never starts a poller, so restart the Host afterwards.
@@ -82,8 +84,9 @@ Most people need no configuration: the install supplies `stateDir`, and sessions
 default to the plugin's own `workspace/` directory. Set `DSH_WEIXIN_CWD` to run
 sessions from a different directory.
 
-The pairing code is read from the `DSH_WEIXIN_BIND_CODE` environment variable
-(rename it with `bindCodeEnv`). The full list of settings — reply chunking,
+You can also set a fixed pairing code in the `DSH_WEIXIN_BIND_CODE` environment
+variable before starting the Host (rename it with `bindCodeEnv`); it is also
+single use. The full list of settings — reply chunking,
 queue size, timeouts, image download limits, logging — is documented in
 `AGENTS.md`; the authoritative schema is `src/config.mjs`.
 
@@ -110,7 +113,7 @@ single-poller lock, retry/backoff, and `-14` handling — are in `AGENTS.md`.
 npm test
 ```
 
-232 offline tests using fake iLink/Host interfaces and disposable fixtures — no
+Offline tests using fake iLink/Host interfaces and disposable fixtures — no
 WeChat account is used.
 
 ## Limitations
