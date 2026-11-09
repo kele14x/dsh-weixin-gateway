@@ -1,15 +1,15 @@
 /**
  * Inbound/outbound message shapes.
  *
- * The MVP is text-only and direct-messages-only. Normalization drops bot echoes
- * (our own `sendmessage` can come back through the poll), keeps the context
- * token needed for replies, and reports media-only messages so the runtime can
- * answer with a notice instead of silence.
+ * Phase 1 understands text and image items. Image descriptors are kept on the
+ * normalized message so the runtime can download them only after the sender has
+ * passed the allowlist. Other media types are counted and reported instead of
+ * being silently dropped.
  *
  * @module dsh-weixin-gateway/ilink/messages
  */
 
-import { ITEM_TYPE_TEXT, MESSAGE_TYPE_BOT } from './constants.mjs'
+import { ITEM_TYPE_IMAGE, ITEM_TYPE_TEXT, MESSAGE_TYPE_BOT } from './constants.mjs'
 
 /**
  * Concatenate the text items of one message.
@@ -33,7 +33,7 @@ export function extractText(items) {
  * Normalize one raw inbound message.
  *
  * @param {any} raw - one element of `getupdates.msgs`.
- * @returns {{messageId: string|number, fromUserId: string, toUserId?: string, contextToken?: string, createTimeMs?: number, groupId?: string, text: string, hasUnsupportedItems: boolean}|null} normalized message, or null to ignore.
+ * @returns {{messageId: string|number, fromUserId: string, toUserId?: string, contextToken?: string, createTimeMs?: number, groupId?: string, text: string, images: object[], unsupportedItemCount: number, hasUnsupportedItems: boolean}|null} normalized message, or null to ignore.
  */
 export function normalizeInbound(raw) {
   if (raw === null || typeof raw !== 'object') return null
@@ -47,7 +47,27 @@ export function normalizeInbound(raw) {
   if (messageId === undefined || messageId === null) return null
 
   const items = Array.isArray(raw.item_list) ? raw.item_list : []
-  const text = extractText(items)
+  const textParts = []
+  const images = []
+  let unsupportedItemCount = 0
+
+  for (const item of items) {
+    if (item === null || typeof item !== 'object') {
+      unsupportedItemCount += 1
+      continue
+    }
+    if (item.type === ITEM_TYPE_TEXT && typeof item.text_item?.text === 'string') {
+      textParts.push(item.text_item.text)
+      continue
+    }
+    if (item.type === ITEM_TYPE_IMAGE && item.image_item !== null && typeof item.image_item === 'object') {
+      images.push(item.image_item)
+      continue
+    }
+    unsupportedItemCount += 1
+  }
+
+  const text = textParts.join('\n').trim()
 
   return {
     messageId,
@@ -59,7 +79,9 @@ export function normalizeInbound(raw) {
     ...(typeof raw.create_time_ms === 'number' ? { createTimeMs: raw.create_time_ms } : {}),
     ...(typeof raw.group_id === 'string' && raw.group_id.length > 0 ? { groupId: raw.group_id } : {}),
     text,
-    hasUnsupportedItems: text.length === 0 && items.length > 0,
+    images,
+    unsupportedItemCount,
+    hasUnsupportedItems: unsupportedItemCount > 0,
   }
 }
 

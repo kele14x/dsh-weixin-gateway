@@ -15,6 +15,7 @@ installation, deployment, and process supervision are managed by the operator.
 - Only chats you approve can reach the agent. Pair a chat once with a code.
 - Long replies arrive as several readable messages instead of being cut off.
 - A typing indicator shows while the agent is working on your message.
+- Send a photo or screenshot and the agent receives it as an image.
 
 ## Requirements
 
@@ -83,8 +84,14 @@ sessions from a different directory.
 
 The pairing code is read from the `DSH_WEIXIN_BIND_CODE` environment variable
 (rename it with `bindCodeEnv`). The full list of settings — reply chunking,
-queue size, timeouts, logging — is documented in `AGENTS.md`; the authoritative
-schema is `src/config.mjs`.
+queue size, timeouts, image download limits, logging — is documented in
+`AGENTS.md`; the authoritative schema is `src/config.mjs`.
+
+Inbound images are downloaded from the WeChat CDN, decrypted, and passed to the
+agent. `maxImageBytes` (default 20 MB) and `mediaTimeoutMs` (default 60 s) bound
+each download; `mediaEnabled: false` keeps the channel text-only. Images require
+a model that accepts image input — `deepseek-flash` does, while `deepseek-v4-pro`
+currently declares text-only input.
 
 ## Security
 
@@ -103,17 +110,19 @@ single-poller lock, retry/backoff, and `-14` handling — are in `AGENTS.md`.
 npm test
 ```
 
-200 offline tests using fake iLink/Host interfaces and disposable fixtures — no
+232 offline tests using fake iLink/Host interfaces and disposable fixtures — no
 WeChat account is used.
 
 ## Limitations
 
-Text direct messages only. No media, group chats, approvals, streaming, or the
-headless `AgentHost` fallback. `maxMessageChars: 1800` is a safety budget, not a
-documented server limit.
+Text and image direct messages. Files, voice, video, group chats, approvals,
+streaming, and the headless `AgentHost` fallback are not implemented. Inbound
+images are supported; sending media from the agent is not.
+`maxMessageChars: 1800` is a safety budget, not a documented server limit.
 
 ## Attribution
 
-The iLink wire format and QR states are adapted from Tencent's MIT-licensed
-[`Tencent/openclaw-weixin`](https://github.com/Tencent/openclaw-weixin) protocol
-notes. There is no OpenClaw runtime dependency. See `THIRD_PARTY_NOTICES.md`.
+The iLink wire format, QR states, and inbound CDN media rules are adapted from
+Tencent's MIT-licensed [`Tencent/openclaw-weixin`](https://github.com/Tencent/openclaw-weixin)
+protocol notes and client behaviour. There is no OpenClaw runtime dependency.
+See `THIRD_PARTY_NOTICES.md`.

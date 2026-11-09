@@ -38,6 +38,16 @@ test('the plugin export is named and has a config schema', () => {
   assert.equal(resolved.maxMessageChars, 1800)
   assert.equal(resolved.replyMode, 'all')
   assert.equal(resolved.bindCodeEnv, 'DSH_WEIXIN_BIND_CODE')
+  assert.equal(resolved.mediaEnabled, true)
+  assert.equal(resolved.cdnBaseUrl, 'https://novac2c.cdn.weixin.qq.com/c2c')
+  assert.equal(resolved.maxImageBytes, 20 * 1024 * 1024)
+  assert.equal(resolved.maxImagesPerMessage, 9)
+  assert.equal(resolved.mediaTimeoutMs, 60_000)
+})
+
+test('the config schema rejects a zero image byte cap', () => {
+  assert.throws(() => Config({ stateDir: '/tmp/state', maxImageBytes: 0 }))
+  assert.equal(Config({ stateDir: '/tmp/state', maxImageBytes: 1 }).maxImageBytes, 1)
 })
 
 test('the config schema rejects a zero chunk size', () => {

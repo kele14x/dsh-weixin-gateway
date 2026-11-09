@@ -20,7 +20,18 @@ import { sleep, raceAbort } from './util/time.mjs'
 import { silentLogger } from './util/log.mjs'
 import { normalizeInbound, isGroupMessage } from './ilink/messages.mjs'
 import { ILinkClient } from './ilink/client.mjs'
-import { TYPING_START, TYPING_STOP, VERSION, botAgentFor } from './ilink/constants.mjs'
+import {
+  DEFAULT_CDN_BASE,
+  TYPING_START,
+  TYPING_STOP,
+  VERSION,
+  botAgentFor,
+} from './ilink/constants.mjs'
+import {
+  DEFAULT_MAX_IMAGE_BYTES,
+  DEFAULT_MEDIA_TIMEOUT_MS,
+  MediaDownloader,
+} from './media/download.mjs'
 import { acquireLock, LockError } from './store/lock.mjs'
 import { AccountStore, safeBotId } from './store/accounts.mjs'
 import { ChannelState } from './store/state.mjs'
@@ -53,6 +64,7 @@ export class Gateway {
    * @param {object} [options.logger] - logger.
    * @param {object} [options.accounts] - account store override.
    * @param {Function} [options.clientFactory] - client factory override for tests.
+   * @param {object} [options.media] - media downloader override for tests.
    * @param {number} [options.lockRetryMs] - delay before retrying a poller lock held elsewhere.
    * @param {number} [options.pauseHeartbeatMs] - lock heartbeat interval during a `-14` pause.
    */
@@ -62,6 +74,7 @@ export class Gateway {
     logger = silentLogger,
     accounts,
     clientFactory,
+    media,
     lockRetryMs = 30_000,
     pauseHeartbeatMs = 60_000,
   }) {
@@ -74,6 +87,21 @@ export class Gateway {
       ((options) => new ILinkClient({ ...options, pollTimeoutMs: config.pollTimeoutMs }))
     this.lockRetryMs = lockRetryMs
     this.pauseHeartbeatMs = pauseHeartbeatMs
+    this.mediaEnabled = config.mediaEnabled !== false
+    this.media = media
+    if (this.mediaEnabled && this.media === undefined) {
+      try {
+        this.media = new MediaDownloader({
+          cdnBaseUrl: config.cdnBaseUrl ?? DEFAULT_CDN_BASE,
+          maxImageBytes: config.maxImageBytes ?? DEFAULT_MAX_IMAGE_BYTES,
+          timeoutMs: config.mediaTimeoutMs ?? DEFAULT_MEDIA_TIMEOUT_MS,
+          logger: this.logger,
+        })
+      } catch (error) {
+        this.mediaEnabled = false
+        this.logger.error('inbound image support is disabled', { reason: error.message })
+      }
+    }
     this.lockRetryTimer = undefined
     this.startPromise = undefined
     this.stopPromise = undefined
@@ -555,12 +583,24 @@ export class Gateway {
       return
     }
 
-    if (message.text.length === 0) {
-      if (message.hasUnsupportedItems) {
-        await this.#sendText(userId, 'Only text messages are supported right now.')
-      }
+    const notices = []
+    if (message.unsupportedItemCount > 0) {
+      notices.push(
+        'Only text and image messages are supported right now; other attachments were skipped.',
+      )
+    }
+    const imagesEnabled = this.mediaEnabled && this.media !== undefined
+    if (message.images.length > 0 && !imagesEnabled) {
+      notices.push('Image messages are not enabled on this gateway.')
+    }
+    const maxImages = this.config.maxImagesPerMessage ?? 9
+    if (imagesEnabled && message.images.length > maxImages) {
+      await this.#sendText(userId, `Too many images in one message (limit ${maxImages}).`)
       return
     }
+    if (notices.length > 0) await this.#sendText(userId, notices.join('\n'))
+
+    if (message.text.length === 0 && (message.images.length === 0 || !imagesEnabled)) return
 
     await this.#enqueue(userId, message)
   }
@@ -638,16 +678,23 @@ export class Gateway {
       const mapping = await this.router.sessionFor(userId)
       active.sessionId = mapping.sessionId
       if (signal.aborted) return
+
+      // Start the typing indicator while the image download runs. `#typing`
+      // never rejects; the collector starts once the prompt content is ready.
+      const typing = this.#typing(userId, true, signal)
+      const images = await this.#loadImages(message, signal)
+      if (signal.aborted) return
+
       turn = this.collector.begin({ sessionId: active.sessionId, requestId: active.requestId, signal })
       turn.promise.catch(() => {})
-      await Promise.race([this.#typing(userId, true, signal), turn.promise])
+      await Promise.race([typing, turn.promise])
       if (signal.aborted) return
 
       active.phase = 'admitting'
       admission = this.host.prompt({
         sessionId: active.sessionId,
         requestId: active.requestId,
-        text: message.text,
+        content: this.#promptContent(message.text, images),
         signal,
       }).then((result) => {
         active.phase = 'running'
@@ -685,6 +732,47 @@ export class Gateway {
       this.suppressAbort.delete(userId)
       await this.#typing(userId, false, signal)
     }
+  }
+
+  /**
+   * Download every image attached to one normalized message.
+   *
+   * Images are fetched only after the sender passed the allowlist and only for
+   * the duration of the turn, so `/stop` cancels an in-flight download.
+   *
+   * @param {object} message - normalized inbound message.
+   * @param {AbortSignal} signal - turn lifetime.
+   * @returns {Promise<Array<{data: Buffer, mediaType: string}>>} decrypted images.
+   */
+  async #loadImages(message, signal) {
+    if (!this.mediaEnabled || this.media === undefined || message.images.length === 0) return []
+    const images = []
+    for (const item of message.images) {
+      images.push(await this.media.downloadImage(item, { signal }))
+    }
+    return images
+  }
+
+  /**
+   * Build the ordered DSH prompt content for text and images.
+   *
+   * @param {string} text - message caption or prompt text.
+   * @param {Array<{data: Buffer, mediaType: string}>} images - downloaded images.
+   * @returns {object[]} DSH content parts.
+   */
+  #promptContent(text, images) {
+    const content = []
+    if (typeof text === 'string' && text.length > 0) {
+      content.push({ type: 'text', text })
+    }
+    for (const image of images) {
+      content.push({
+        type: 'image',
+        data: image.data.toString('base64'),
+        mediaType: image.mediaType,
+      })
+    }
+    return content
   }
 
   /**
@@ -748,6 +836,58 @@ export class Gateway {
     if (this.abort?.signal.aborted) return
     const code = error?.code
 
+    if (code === 'aborted' || code === 'disposed' || code === 'media/aborted') return
+
+    if (code === 'media/too-large') {
+      const limit = this.config.maxImageBytes ?? DEFAULT_MAX_IMAGE_BYTES
+      const megabytes = Math.max(1, Math.round(limit / (1024 * 1024)))
+      await this.#sendText(userId, `That image is too large to process (limit ${megabytes} MB).`)
+      return
+    }
+    if (code === 'media/unsupported-type') {
+      await this.#sendText(
+        userId,
+        'That image format is not supported. Send a PNG, JPEG, WebP, or GIF image.',
+      )
+      return
+    }
+    if (
+      code === 'media/no-url' ||
+      code === 'media/empty' ||
+      code === 'media/http' ||
+      code === 'media/network' ||
+      code === 'media/timeout' ||
+      code === 'media/blocked-url' ||
+      code === 'media/blocked-host'
+    ) {
+      this.logger.warn('inbound image download failed', {
+        code,
+        ...(error.status === undefined ? {} : { status: error.status }),
+      })
+      await this.#sendText(userId, 'Could not download the image. Please send it again.')
+      return
+    }
+    if (code === 'media/decrypt' || code === 'media/invalid-key') {
+      this.logger.warn('inbound image decryption failed', { code })
+      await this.#sendText(userId, 'The image could not be decrypted. Please send it again.')
+      return
+    }
+    if (code === 'session/attachment-invalid') {
+      const reason = error.details?.reason ?? error.reason
+      if (
+        reason === 'MODEL_DOES_NOT_SUPPORT_IMAGES' ||
+        /does not support image input/i.test(error.message ?? '')
+      ) {
+        await this.#sendText(
+          userId,
+          'The selected model does not accept image input. Switch to an image-capable model (for example deepseek-flash) or send text only.',
+        )
+        return
+      }
+      await this.#sendText(userId, `The attachment was rejected: ${shorten(error.message)}`)
+      return
+    }
+
     if (code === 'turn-timeout') {
       const active = this.active.get(userId)
       if (active.phase === 'preparing') {
@@ -778,7 +918,6 @@ export class Gateway {
       await this.#sendText(userId, 'The agent is busy with another prompt. Try again in a moment.')
       return
     }
-    if (code === 'aborted' || code === 'disposed') return
 
     this.logger.error('turn failed', error)
     await this.#sendText(userId, `The agent request failed: ${shorten(error.message)}`)

@@ -68,22 +68,22 @@ export class SessionControllerHost {
   }
 
   /**
-   * Admit one text prompt into a Session's queue.
+   * Admit one prompt into a Session's queue.
    *
    * @param {object} options - prompt options.
    * @param {string} options.sessionId - target Session.
    * @param {string} options.requestId - stable client-minted identity.
-   * @param {string} options.text - prompt text.
+   * @param {object[]} options.content - ordered DSH content parts (text and encoded images).
    * @param {AbortSignal} options.signal - caller lifetime.
    * @returns {Promise<void>} resolves once the Agent accepted the prompt.
    */
-  async prompt({ sessionId, requestId, text, signal }) {
+  async prompt({ sessionId, requestId, content, signal }) {
     await this.ctx.sessionController.prompt(
       {
         sessionId,
         requestId,
         mode: 'queue',
-        content: [{ type: 'text', text }],
+        content,
       },
       signal,
     )

@@ -12,6 +12,7 @@
 import z from '@deepseek-ai/schemastery'
 import {
   DEFAULT_BASE_URL,
+  DEFAULT_CDN_BASE,
   DEFAULT_POLL_TIMEOUT_MS,
   MAX_TEXT_CHARS,
   SESSION_PAUSED_MS,
@@ -36,6 +37,29 @@ export const Config = z.object({
     .string()
     .default(DEFAULT_BASE_URL)
     .description('iLink API origin. A QR redirect may override it for the saved account.'),
+  mediaEnabled: z
+    .boolean()
+    .default(true)
+    .description('Download inbound images and pass them to the agent.'),
+  cdnBaseUrl: z
+    .string()
+    .default(DEFAULT_CDN_BASE)
+    .description('WeChat media CDN origin used when a message has no full media URL.'),
+  maxImageBytes: z
+    .natural()
+    .min(1)
+    .default(20 * 1024 * 1024)
+    .description('Maximum downloaded bytes for one inbound image.'),
+  maxImagesPerMessage: z
+    .natural()
+    .min(1)
+    .default(9)
+    .description('Maximum number of images accepted in one inbound WeChat message.'),
+  mediaTimeoutMs: z
+    .natural()
+    .min(1)
+    .default(60_000)
+    .description('Total deadline for one inbound media download, in milliseconds.'),
   maxMessageChars: z
     .natural()
     .min(1)

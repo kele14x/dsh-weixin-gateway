@@ -13,8 +13,10 @@ behaviour from Tencent's WeChat channel and bundles one runtime dependency.
 The iLink request format, the eight QR-login states, the header sets, the
 `base_info` layout, the message field names, and the `-14` semantics in this
 repository are derived from the upstream protocol documentation and client
-behaviour. No upstream code is copied wholesale, and OpenClaw is **not** a runtime
-dependency: no OpenClaw process is started or required.
+behaviour. The inbound media rules (AES-128-ECB/PKCS#7, the accepted key
+encodings, and CDN URL construction) and the lossless uint64 message-id parser
+are adapted from the upstream client; the parser is a modified port. No OpenClaw
+runtime is started or required, and OpenClaw is **not** a runtime dependency.
 
 Upstream license:
 

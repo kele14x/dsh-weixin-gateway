@@ -11,6 +11,7 @@ import { acquireLock, LockError } from '../src/store/lock.mjs'
 import { createLogger } from '../src/util/log.mjs'
 import { FakeClient } from './helpers/fake-client.mjs'
 import { FakeHost } from './helpers/fake-host.mjs'
+import { FakeMedia, JPEG_BYTES } from './helpers/fake-media.mjs'
 import { cleanup, makeTempDir, waitFor } from './helpers/tmp.mjs'
 
 /**
@@ -87,6 +88,36 @@ function textMessage({ id = 1, from = 'u1', text = 'hello', context = 'ctx-1' } 
     context_token: context,
     create_time_ms: Date.now(),
     item_list: [{ type: 1, text_item: { text } }],
+  }
+}
+
+/**
+ * Build one inbound message carrying images and optional text.
+ *
+ * @param {object} [options] - message fields.
+ * @returns {object} raw iLink message.
+ */
+function imageMessage({ id = 1, from = 'u1', text = '', images = 1, context = 'ctx-1' } = {}) {
+  const items = []
+  if (text.length > 0) items.push({ type: 1, text_item: { text } })
+  for (let index = 0; index < images; index += 1) {
+    items.push({
+      type: 2,
+      image_item: {
+        media: { encrypt_query_param: `param-${index}` },
+        aeskey: '00112233445566778899aabbccddeeff',
+        mid_size: 128,
+      },
+    })
+  }
+  return {
+    message_id: id,
+    from_user_id: from,
+    to_user_id: 'bot',
+    message_type: 1,
+    context_token: context,
+    create_time_ms: Date.now(),
+    item_list: items,
   }
 }
 
@@ -240,23 +271,147 @@ test('a completed turn without text still produces a notice', async (t) => {
   assert.match(client.sent[0].text, /without text output/)
 })
 
-test('a media-only message is answered with a text-only notice', async (t) => {
+test('an image-only message is sent to the host as an image prompt', async (t) => {
+  const media = new FakeMedia()
+  const { client, host, gateway } = await setup(t, {
+    msgs: [imageMessage()],
+    gatewayOptions: { media },
+  })
+  await gateway.start()
+  await waitFor(() => host.callsOf('prompt').length === 1, { message: 'image prompt' })
+
+  assert.equal(media.calls.length, 1)
+  const prompt = host.callsOf('prompt')[0]
+  assert.equal(prompt.content.length, 1)
+  assert.equal(prompt.content[0].type, 'image')
+  assert.equal(prompt.content[0].mediaType, 'image/jpeg')
+  assert.equal(prompt.content[0].data, JPEG_BYTES.toString('base64'))
+  assert.equal(prompt.text, '')
+  assert.doesNotMatch(client.sent[0]?.text ?? '', /Only text messages/)
+})
+
+test('text and images keep their order in one prompt', async (t) => {
+  const media = new FakeMedia()
+  const { host, gateway } = await setup(t, {
+    msgs: [imageMessage({ text: 'what is this?', images: 2 })],
+    gatewayOptions: { media },
+  })
+  await gateway.start()
+  await waitFor(() => host.callsOf('prompt').length === 1, { message: 'mixed prompt' })
+
+  const prompt = host.callsOf('prompt')[0]
+  assert.deepEqual(prompt.content.map((part) => part.type), ['text', 'image', 'image'])
+  assert.equal(prompt.content[0].text, 'what is this?')
+})
+
+test('an image download failure is answered without prompting the agent', async (t) => {
+  const failure = Object.assign(new Error('media download answered HTTP 500'), {
+    code: 'media/http',
+    status: 500,
+  })
+  const { client, host, gateway } = await setup(t, {
+    msgs: [imageMessage()],
+    gatewayOptions: { media: new FakeMedia({ failWith: failure }) },
+  })
+  await gateway.start()
+  await waitFor(() => client.sent.length > 0, { message: 'failure reply' })
+
+  assert.equal(host.callsOf('prompt').length, 0)
+  assert.match(client.sent[0].text, /Could not download the image/)
+})
+
+test('an unsupported image format is answered with an actionable notice', async (t) => {
+  const failure = Object.assign(new Error('not an image'), { code: 'media/unsupported-type' })
+  const { client, host, gateway } = await setup(t, {
+    msgs: [imageMessage()],
+    gatewayOptions: { media: new FakeMedia({ failWith: failure }) },
+  })
+  await gateway.start()
+  await waitFor(() => client.sent.length > 0, { message: 'format reply' })
+
+  assert.equal(host.callsOf('prompt').length, 0)
+  assert.match(client.sent[0].text, /PNG, JPEG, WebP, or GIF/)
+})
+
+test('a text-only model rejection is answered with a model hint', async (t) => {
+  const { client, host, gateway } = await setup(t, {
+    msgs: [imageMessage()],
+    gatewayOptions: { media: new FakeMedia() },
+  })
+  host.prompt = async (options) => {
+    host.calls.push({ type: 'prompt', sessionId: options.sessionId, requestId: options.requestId })
+    throw Object.assign(new Error('Model "deepseek-v4-pro" does not support image input.'), {
+      code: 'session/attachment-invalid',
+      details: { reason: 'MODEL_DOES_NOT_SUPPORT_IMAGES' },
+    })
+  }
+  await gateway.start()
+  await waitFor(() => client.sent.length > 0, { message: 'model hint' })
+
+  assert.equal(host.callsOf('prompt').length, 1)
+  assert.match(client.sent[0].text, /does not accept image input/)})
+
+test('an unpaired sender cannot trigger an image download', async (t) => {
+  const media = new FakeMedia()
+  const { client, host, gateway } = await setup(t, {
+    msgs: [imageMessage({ from: 'u2' })],
+    allowed: false,
+    gatewayOptions: { media },
+  })
+  await gateway.start()
+  await waitFor(() => client.sent.length > 0, { message: 'pairing hint' })
+
+  assert.equal(media.calls.length, 0)
+  assert.equal(host.callsOf('prompt').length, 0)
+  assert.match(client.sent[0].text, /not paired/)
+})
+
+test('disabled media keeps text and refuses image-only messages', async (t) => {
+  const media = new FakeMedia()
+  const { client, host, gateway } = await setup(t, {
+    msgs: [imageMessage()],
+    config: { mediaEnabled: false },
+    gatewayOptions: { media },
+  })
+  await gateway.start()
+  await waitFor(() => client.sent.length > 0, { message: 'media disabled notice' })
+
+  assert.equal(media.calls.length, 0)
+  assert.equal(host.callsOf('prompt').length, 0)
+  assert.match(client.sent[0].text, /not enabled/)
+})
+
+test('a non-image attachment is answered with a support notice', async (t) => {
   const { client, host, gateway } = await setup(t, {
     msgs: [
       {
-        message_id: 9,
+        message_id: 12,
         from_user_id: 'u1',
         message_type: 1,
         context_token: 'ctx',
-        item_list: [{ type: 2, image_item: { mid_size: 10 } }],
+        item_list: [{ type: 4, file_item: { file_name: 'report.pdf' } }],
       },
     ],
   })
   await gateway.start()
-  await waitFor(() => client.sent.length > 0, { message: 'notice' })
+  await waitFor(() => client.sent.length > 0, { message: 'unsupported attachment notice' })
 
   assert.equal(host.callsOf('prompt').length, 0)
-  assert.match(client.sent[0].text, /Only text messages/)
+  assert.match(client.sent[0].text, /Only text and image messages/)
+})
+
+test('more images than the configured limit are refused before download', async (t) => {
+  const media = new FakeMedia()
+  const { client, host, gateway } = await setup(t, {
+    msgs: [imageMessage({ images: 10 })],
+    gatewayOptions: { media },
+  })
+  await gateway.start()
+  await waitFor(() => client.sent.length > 0, { message: 'image count notice' })
+
+  assert.equal(media.calls.length, 0)
+  assert.equal(host.callsOf('prompt').length, 0)
+  assert.match(client.sent[0].text, /Too many images/)
 })
 
 test('a second gateway on the same account refuses to poll', async (t) => {

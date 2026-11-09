@@ -44,13 +44,18 @@ export class FakeHost {
   /**
    * Admit a prompt and, unless disabled, emit one complete turn.
    *
-   * @param {{sessionId: string, requestId: string, text: string}} options - prompt.
+   * @param {{sessionId: string, requestId: string, text?: string, content?: object[]}} options - prompt.
    * @returns {Promise<void>} resolves immediately.
    */
-  async prompt({ sessionId, requestId, text }) {
-    this.calls.push({ type: 'prompt', sessionId, requestId, text })
+  async prompt({ sessionId, requestId, text, content }) {
+    const parts = Array.isArray(content) ? content : [{ type: 'text', text }]
+    const rendered = parts
+      .filter((part) => part?.type === 'text' && typeof part.text === 'string')
+      .map((part) => part.text)
+      .join('\n')
+    this.calls.push({ type: 'prompt', sessionId, requestId, text: rendered, content: parts })
     if (!this.autoRespond) return
-    this.emitTurn({ sessionId, requestId, text })
+    this.emitTurn({ sessionId, requestId, text: rendered })
   }
 
   /**

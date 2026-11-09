@@ -95,6 +95,7 @@ provides a DSH plugin, not Host deployment or process supervision.
 
 ## Remaining limitations
 
+- **Media scope:** Only inbound images are implemented. Files, voice, video, and outbound media are still unsupported; mixed messages keep their images and text and report the skipped items. The CDN media rules are derived from Tencent's client behaviour, not a stable public contract, and have not been exercised against a live WeChat account.
 - **Delivery durability:** Queues remain in memory and dedupe can persist before execution. Crashes or shutdown can lose queued work; exactly-once execution is not guaranteed.
 - **Cancellation retention:** Handles retained after failed timeout cancellation need `/stop` or teardown; later terminal events do not automatically clear them.
 - **Shutdown deadline:** Uncancellable session creation/persistence or admission that never settles can block shutdown indefinitely.
@@ -104,6 +105,7 @@ provides a DSH plugin, not Host deployment or process supervision.
 
 ## Validation and scope
 
+- After adding inbound image support: all **232 offline plugin tests** passed, plus `npm run check` and `git diff --check`. Media tests cover AES key encodings, AES-128-ECB round trips, CDN URL construction, byte caps, host allowlisting, image magic-byte sniffing, lossless uint64 ids, and the gateway image prompt/failure paths. No live WeChat account, CDN, or DSH Host was exercised.
 - After removing Host setup examples and their 32 example-only tests: all **200 remaining offline plugin tests** passed, plus `npm run check` and `git diff --check`. Plugin runtime code is unchanged; no live WeChat account or DSH Host was exercised.
 - Fixes for issues 19–21 in `9d6331d`: all **232 offline tests** passed, including 32 checks for the now-removed Host healthcheck example, plus `npm run check`, explicit syntax checks of the changed modules, and `git diff --check`. Native macOS identity probes were checked across processes with differing locale/timezone settings. Linux `/proc` parsing used injected fixtures; PID reuse and boot changes were simulated. Plugin coverage also includes five-contender generation takeovers, deadline-bound QR fetch/acknowledgement cancellation, and late confirmation. No native Linux kernel, live WeChat account, or DSH Host was exercised.
 - Fixes for issues 17 and 18 in `def3f4e`: all **154 offline tests** passed, plus `npm run check`, explicit syntax checks of the changed source modules, and `git diff --check`. Coverage includes forced account replacement, logout without fallback, missing/corrupt selection, failed selection writes, and failed state writes with same-value retries and concurrent callers. No live WeChat account or DSH Host was exercised.

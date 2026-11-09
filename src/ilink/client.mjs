@@ -31,6 +31,7 @@ import {
 } from './constants.mjs'
 import { abortError } from '../util/time.mjs'
 import { silentLogger } from '../util/log.mjs'
+import { parseJsonPreservingIds } from './json.mjs'
 
 /** Error raised for transport, HTTP, protocol, or business failures. */
 export class ILinkError extends Error {
@@ -238,7 +239,9 @@ export class ILinkClient {
     let data = {}
     if (text.length > 0) {
       try {
-        data = JSON.parse(text)
+        // iLink returns uint64 ids as JSON numbers; parse them losslessly so
+        // dedupe never merges two distinct messages that lost precision.
+        data = parseJsonPreservingIds(text)
       } catch (error) {
         throw new ILinkError('malformed JSON response', { code: 'protocol', cause: error })
       }

@@ -16,7 +16,7 @@ const LEVELS = Object.freeze({
   silent: 100,
 })
 
-const SECRET_KEY = /^(authorization|bottoken|bot_token|contexttoken|context_token|qrcode|qrcodevalue|typingticket|typing_ticket|password|secret|bindcode|bind_code)$/i
+const SECRET_KEY = /^(authorization|bottoken|bot_token|contexttoken|context_token|qrcode|qrcodevalue|typingticket|typing_ticket|password|secret|bindcode|bind_code|aeskey|aes_key|encrypt_query_param|upload_param|encrypted_param|encrypted_query_param|x-encrypted-param|fullurl|full_url)$/i
 
 /**
  * Remove values that must never be persisted to logs from one string.
@@ -26,6 +26,7 @@ const SECRET_KEY = /^(authorization|bottoken|bot_token|contexttoken|context_toke
  */
 export function scrubString(value) {
   return String(value)
+    .replace(/((?:encrypted_query_param|encrypt_query_param|upload_param|encrypted_param)=)[^&\s"']+/gi, '$1[redacted]')
     .replace(/qrcode=[^&\s"']+/gi, 'qrcode=[redacted]')
     .replace(/(bearer)\s+[A-Za-z0-9._~+/=-]+/gi, '$1 [redacted]')
 }

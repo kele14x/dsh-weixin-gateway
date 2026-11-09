@@ -24,7 +24,7 @@ export const VERSION = manifest.version
 /** Default API origin. The QR login flow may switch to a server-supplied redirect. */
 export const DEFAULT_BASE_URL = 'https://ilinkai.weixin.qq.com'
 
-/** Default media CDN origin (phase 2; unused by the text-only MVP). */
+/** Default media CDN origin used when an inbound image has no full URL. */
 export const DEFAULT_CDN_BASE = 'https://novac2c.cdn.weixin.qq.com/c2c'
 
 /** `iLink-App-Id` value: the bot application id. */
@@ -63,6 +63,18 @@ export const MESSAGE_TYPE_BOT = 2
 
 /** `MessageItem.type`: plain text item. */
 export const ITEM_TYPE_TEXT = 1
+
+/** `MessageItem.type`: image item. */
+export const ITEM_TYPE_IMAGE = 2
+
+/** `MessageItem.type`: voice item. */
+export const ITEM_TYPE_VOICE = 3
+
+/** `MessageItem.type`: file attachment item. */
+export const ITEM_TYPE_FILE = 4
+
+/** `MessageItem.type`: video item. */
+export const ITEM_TYPE_VIDEO = 5
 
 /** `sendTyping.status`: start the typing indicator. */
 export const TYPING_START = 1
