@@ -32,7 +32,10 @@ test('redemption atomically persists authorization and only a SHA256 code finger
   assert.equal(typeof document.users.u1.boundAt, 'number')
   assert.deepEqual(document.consumedCodeHashes, [createHash('sha256').update(code).digest('hex')])
   assert.equal(text.includes(code), false)
-  assert.equal((await stat(allowed.file)).mode & 0o777, 0o600)
+  // Windows has no POSIX mode bits and reports every regular file as 0o666.
+  if (process.platform !== 'win32') {
+    assert.equal((await stat(allowed.file)).mode & 0o777, 0o600)
+  }
 
   const restarted = await reopen(stateDir)
   assert.equal(restarted.isAllowed('u1'), true)

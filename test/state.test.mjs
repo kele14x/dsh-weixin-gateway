@@ -105,7 +105,10 @@ test('state files are written with mode 0600', async (t) => {
   const state = await loadedState(dir)
   await state.setCursor('cursor-1')
   const info = await stat(join(dir, 'state', 'bot1.json'))
-  assert.equal(info.mode & 0o777, 0o600)
+  // Windows has no POSIX mode bits and reports every regular file as 0o666.
+  if (process.platform !== 'win32') {
+    assert.equal(info.mode & 0o777, 0o600)
+  }
 })
 
 test('a corrupt state file is reported instead of replaced', async (t) => {

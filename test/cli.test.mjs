@@ -128,7 +128,10 @@ test('forced login replaces the active account and logout cannot reactivate an o
 
   assert.equal(await main(['login', '--state-dir', stateDir, '--force', '--no-qr']), 0)
   assert.equal((await accounts.active()).botId, 'new-bot')
-  assert.equal((await stat(accounts.activeFile)).mode & 0o777, 0o600)
+  // Windows has no POSIX mode bits and reports every regular file as 0o666.
+  if (process.platform !== 'win32') {
+    assert.equal((await stat(accounts.activeFile)).mode & 0o777, 0o600)
+  }
   assert.equal(await main(['status', '--state-dir', stateDir]), 0)
   assert.ok(output.logs.includes('active account: new-bot'))
   assert.equal(await main(['logout', '--state-dir', stateDir, '--yes']), 0)
