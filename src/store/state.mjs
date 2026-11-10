@@ -10,6 +10,7 @@
  */
 
 import { join } from 'node:path'
+import { readdir } from 'node:fs/promises'
 import { ensureDir, readJson, writeJsonAtomic } from './atomic.mjs'
 import { silentLogger } from '../util/log.mjs'
 
@@ -303,4 +304,46 @@ export class ChannelState {
       contextTokens: this.contextTokens.size,
     }
   }
+}
+
+/**
+ * Session mappings recorded across every account state file.
+ *
+ * Workspace grouping needs every conversation the channel already created, not
+ * only the active account's, so this reads the state directory directly instead
+ * of instantiating one `ChannelState` per bot. Unreadable or malformed files are
+ * skipped: grouping is cosmetic and must never keep the channel from starting.
+ *
+ * @param {string} stateDir - channel state root (the parent of `state/`).
+ * @returns {Promise<{botId: string, userId: string, sessionId: string, cwd?: string}[]>} recorded mappings.
+ */
+export async function sessionMappings(stateDir) {
+  const dir = join(stateDir, 'state')
+  let names
+  try {
+    names = await readdir(dir)
+  } catch (error) {
+    if (error?.code === 'ENOENT') return []
+    throw error
+  }
+
+  const mappings = []
+  for (const name of names.sort()) {
+    if (!name.endsWith('.json')) continue
+    const document = await readJson(join(dir, name), null).catch(() => null)
+    if (document === null || typeof document !== 'object' || Array.isArray(document)) continue
+    const sessions = document.sessions
+    if (sessions === null || typeof sessions !== 'object' || Array.isArray(sessions)) continue
+    const botId = typeof document.botId === 'string' ? document.botId : name.slice(0, -'.json'.length)
+    for (const [userId, record] of Object.entries(sessions)) {
+      if (typeof record?.sessionId !== 'string' || record.sessionId.length === 0) continue
+      mappings.push({
+        botId,
+        userId,
+        sessionId: record.sessionId,
+        ...(typeof record.cwd === 'string' ? { cwd: record.cwd } : {}),
+      })
+    }
+  }
+  return mappings
 }

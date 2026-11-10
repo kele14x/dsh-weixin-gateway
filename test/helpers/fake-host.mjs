@@ -32,13 +32,13 @@ export class FakeHost {
   /**
    * Create a session id.
    *
-   * @param {{cwd: string, agentPreset?: string}} options - creation options.
+   * @param {{cwd: string, workspaceId?: string, agentPreset?: string}} options - creation options.
    * @returns {Promise<string>} session id.
    */
-  async createSession({ cwd, agentPreset }) {
+  async createSession({ cwd, workspaceId, agentPreset }) {
     this.created += 1
     const sessionId = `${this.prefix}-${this.created}`
-    this.calls.push({ type: 'create', sessionId, cwd, agentPreset })
+    this.calls.push({ type: 'create', sessionId, cwd, workspaceId, agentPreset })
     return sessionId
   }
 

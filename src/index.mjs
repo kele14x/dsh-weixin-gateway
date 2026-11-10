@@ -11,9 +11,10 @@
 import { isAbsolute, join, resolve } from 'node:path'
 import { mkdirSync, statSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
-import { Config } from './config.mjs'
+import { Config, DEFAULT_WORKSPACE_TITLE } from './config.mjs'
 import { createLogger } from './util/log.mjs'
 import { createHost } from './bridge/host.mjs'
+import { WorkspaceBinder } from './bridge/workspace.mjs'
 import { Gateway } from './runtime.mjs'
 
 export const name = 'dsh-weixin-gateway'
@@ -91,13 +92,28 @@ export function apply(ctx, config) {
   }
   const resolvedConfig = { ...config, defaultCwd }
 
+  // Grouping is cosmetic: without the registry (headless profiles) or with an
+  // empty title the channel runs exactly as before and Sessions stay ungrouped.
+  const workspaceTitle = (
+    typeof config.workspaceTitle === 'string' ? config.workspaceTitle : DEFAULT_WORKSPACE_TITLE
+  ).trim()
+  const workspace =
+    workspaceTitle.length === 0
+      ? undefined
+      : new WorkspaceBinder({
+          stateDir: config.stateDir,
+          dir: defaultCwd,
+          title: workspaceTitle,
+          logger,
+        })
+
   ctx.inject(['sessionController'], (child) => {
     child.effect(() => {
       let gateway
       let starting
       try {
         const host = createHost(child, { logger })
-        gateway = new Gateway({ config: resolvedConfig, host, logger })
+        gateway = new Gateway({ config: resolvedConfig, host, workspace, logger })
         starting = gateway.start().catch((error) => {
           logger.error('the WeChat gateway failed to start', error)
         })
@@ -113,5 +129,20 @@ export function apply(ctx, config) {
         })
       }
     }, 'weixin-gateway')
+
+    if (workspace === undefined) return
+
+    // The registry is optional: a profile without it leaves the channel
+    // ungrouped rather than disabled. This effect also runs when the service
+    // becomes available later, so a slow profile still groups its Sessions.
+    child.inject(['workspaceRegistry'], (registryCtx) => {
+      registryCtx.effect(() => {
+        workspace.use(registryCtx.workspaceRegistry)
+        workspace.adopt().catch((error) => {
+          logger.warn('could not group existing WeChat conversations', { reason: error.message })
+        })
+        return () => workspace.detach()
+      }, 'weixin-workspace')
+    })
   })
 }

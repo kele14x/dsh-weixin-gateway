@@ -192,3 +192,54 @@ test('session creation is shared per sender without blocking other senders', asy
   assert.equal(restarted.sessionFor('u1').sessionId, 'first-session')
   assert.equal(restarted.sessionFor('u2').sessionId, 'other-session')
 })
+
+test('a grouped channel creates the Session in its Workspace and records the Workspace path', async (t) => {
+  const stateDir = await makeTempDir('session-router-grouped')
+  t.after(() => cleanup(stateDir))
+  const state = new ChannelState({ stateDir, botId: 'bot1' })
+  await state.load()
+  const calls = []
+  const host = {
+    async createSession(options) {
+      calls.push(options)
+      return 'grouped-session'
+    },
+  }
+  const workspace = {
+    async ensure() {
+      return { workspaceId: 'ws-1', path: '/tmp/canonical-wechat', title: '微信' }
+    },
+  }
+  const router = new SessionRouter({ host, state, defaultCwd: '/tmp/project', workspace })
+
+  assert.deepEqual(await router.sessionFor('u1'), {
+    sessionId: 'grouped-session',
+    cwd: '/tmp/canonical-wechat',
+    created: true,
+  })
+  assert.deepEqual(calls, [{ cwd: '/tmp/canonical-wechat', workspaceId: 'ws-1' }])
+  assert.equal(state.sessionFor('u1').cwd, '/tmp/canonical-wechat')
+})
+
+test('a channel without a resolved Workspace keeps creating ungrouped Sessions', async (t) => {
+  const stateDir = await makeTempDir('session-router-ungrouped')
+  t.after(() => cleanup(stateDir))
+  const state = new ChannelState({ stateDir, botId: 'bot1' })
+  await state.load()
+  const calls = []
+  const host = {
+    async createSession(options) {
+      calls.push(options)
+      return 'plain-session'
+    },
+  }
+  const workspace = { async ensure() { return undefined } }
+  const router = new SessionRouter({ host, state, defaultCwd: '/tmp/project', workspace })
+
+  assert.deepEqual(await router.sessionFor('u1'), {
+    sessionId: 'plain-session',
+    cwd: '/tmp/project',
+    created: true,
+  })
+  assert.deepEqual(calls, [{ cwd: '/tmp/project' }])
+})

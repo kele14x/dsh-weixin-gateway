@@ -17,7 +17,33 @@ All WeChat traffic is outbound HTTPS: QR login, one long poll for inbound
 messages, outbound sends, and inbound media downloads from the WeChat CDN. There
 is no webhook, no callback, and no inbound port. The plugin runs inside the DSH
 Host and depends only on the `sessionController` service (the `web` profile
-composes it); it opens no socket of its own.
+composes it); it opens no socket of its own. `workspaceRegistry` is optional and
+used only for sidebar grouping.
+
+## Sidebar grouping
+
+The Web sidebar lists a Session under a Workspace only while that Workspace
+records it, so Sessions created in an unregistered directory render as
+“未分组”. `WorkspaceBinder` (`src/bridge/workspace.mjs`) prevents that:
+
+- It registers the channel's session directory through the optional
+  `workspaceRegistry` service (`ctx.inject(['workspaceRegistry'], …)` inside the
+  `sessionController` injection) and caches the resulting id. `workspaceTitle`
+  (default `WeChat`) is used only when the Workspace is first created, so a manual
+  rename survives restarts, and an empty title disables grouping entirely.
+- New Sessions are created as `sessionController.create({ workspaceId })`, which
+  attaches them in the same call. A `workspace/not-found` response falls back to
+  an ungrouped Session in `defaultCwd`, so deleting the group never blocks a turn.
+- At mount it adopts the Sessions recorded in `<stateDir>/state/*.json` (all
+  accounts), so conversations that already existed join the group without a new
+  message. Unreadable state files, stale ids, and Sessions created in another
+  directory are skipped with a debug log.
+- No Workspace is created until a recorded Session exists or the first new one is
+  created, so an unused channel shows no empty group. Deleting the group makes
+  Sessions ungrouped until the next start, which recreates it; `workspaceTitle: ''`
+  keeps them ungrouped permanently.
+- A profile without the registry (headless hosts) runs unchanged; a registry
+  failure logs a warning and never stops the channel.
 
 ## Media support
 
@@ -93,6 +119,7 @@ optional: empty (the default) uses the plugin's own `workspace/` directory, and
 |---|---|---|
 | `stateDir` | — | credentials, cursor, allowlist, pairing code, lock |
 | `defaultCwd` | `<plugin>/workspace` | workspace for new sessions |
+| `workspaceTitle` | `WeChat` | sidebar group title; empty leaves sessions ungrouped |
 | `agentPreset` | — | preset for new sessions |
 | `baseUrl` | iLink default | API origin; a QR redirect may override it per account |
 | `mediaEnabled` | `true` | download inbound images and pass them to the agent |

@@ -18,13 +18,15 @@ export class SessionRouter {
    * @param {import('../store/state.mjs').ChannelState} options.state - durable state.
    * @param {string} options.defaultCwd - working directory for new Sessions.
    * @param {string} [options.agentPreset] - preset for new Sessions.
+   * @param {import('./workspace.mjs').WorkspaceBinder} [options.workspace] - optional sidebar grouping.
    * @param {object} [options.logger] - logger.
    */
-  constructor({ host, state, defaultCwd, agentPreset, logger = silentLogger }) {
+  constructor({ host, state, defaultCwd, agentPreset, workspace, logger = silentLogger }) {
     this.host = host
     this.state = state
     this.defaultCwd = defaultCwd
     this.agentPreset = agentPreset
+    this.workspace = workspace
     this.logger = logger
     /** @type {Map<string, Promise<object>>} in-flight operations per sender */
     this.inflight = new Map()
@@ -82,16 +84,27 @@ export class SessionRouter {
   /**
    * Create one Session and persist its mapping.
    *
+   * The Session joins the channel's Workspace when grouping is available, so it
+   * renders under that group instead of "Ungrouped"; otherwise it is created in
+   * `defaultCwd` exactly as before.
+   *
    * @param {string} userId - WeChat sender id.
    * @returns {Promise<{sessionId: string, cwd: string, created: true}>} new mapping.
    */
   async #create(userId) {
+    const binding = await this.workspace?.ensure()
+    const cwd = binding?.path ?? this.defaultCwd
     const sessionId = await this.host.createSession({
-      cwd: this.defaultCwd,
+      cwd,
+      ...(binding === undefined ? {} : { workspaceId: binding.workspaceId }),
       ...(this.agentPreset === undefined ? {} : { agentPreset: this.agentPreset }),
     })
-    await this.state.setSession(userId, { sessionId, cwd: this.defaultCwd })
-    this.logger.info('created session', { userId, sessionId })
-    return { sessionId, cwd: this.defaultCwd, created: true }
+    await this.state.setSession(userId, { sessionId, cwd })
+    this.logger.info('created session', {
+      userId,
+      sessionId,
+      ...(binding === undefined ? {} : { workspaceId: binding.workspaceId }),
+    })
+    return { sessionId, cwd, created: true }
   }
 }

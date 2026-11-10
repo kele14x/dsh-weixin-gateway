@@ -207,3 +207,69 @@ test('a promise resolving undefined is claimed and fails closed rather than dele
   assert.equal(await record.subscriptions[0].listener(approvalRequest(), unexpectedNext), 'unavailable')
   assert.deepEqual(record.logs, [])
 })
+
+/** Session Controller stub that records creation requests. */
+function controllerCtx(create, logs = []) {
+  return {
+    sessionController: { create },
+    logger: { error: (...args) => logs.push(args) },
+  }
+}
+
+test('createSession names the Workspace instead of a cwd when the Session is grouped', async () => {
+  const requests = []
+  const ctx = controllerCtx(async (request) => {
+    requests.push(request)
+    return { sessionId: 'sess-1' }
+  })
+  const host = new SessionControllerHost(ctx)
+
+  assert.equal(await host.createSession({ cwd: '/tmp/project', workspaceId: 'ws-1', agentPreset: 'coding' }), 'sess-1')
+  assert.deepEqual(requests, [{ workspaceId: 'ws-1', agentPreset: 'coding' }])
+})
+
+test('createSession keeps creating in cwd when no Workspace is named', async () => {
+  const requests = []
+  const ctx = controllerCtx(async (request) => {
+    requests.push(request)
+    return { sessionId: 'sess-1' }
+  })
+  const host = new SessionControllerHost(ctx)
+
+  assert.equal(await host.createSession({ cwd: '/tmp/project' }), 'sess-1')
+  assert.deepEqual(requests, [{ cwd: '/tmp/project' }])
+})
+
+test('createSession retries in cwd when the Workspace disappeared underneath the channel', async () => {
+  const requests = []
+  const warnings = []
+  const missing = new Error('workspace "ws-1" not found')
+  missing.code = 'workspace/not-found'
+  const ctx = controllerCtx(
+    async (request) => {
+      requests.push(request)
+      if (requests.length === 1) throw missing
+      return { sessionId: 'sess-2' }
+    },
+    warnings,
+  )
+  const host = new SessionControllerHost(ctx, { logger: { warn: (...args) => warnings.push(args), error() {} } })
+
+  assert.equal(await host.createSession({ cwd: '/tmp/project', workspaceId: 'ws-1' }), 'sess-2')
+  assert.deepEqual(requests, [{ workspaceId: 'ws-1' }, { cwd: '/tmp/project' }])
+  assert.equal(warnings.length, 1)
+  assert.match(warnings[0][0], /creating an ungrouped Session/)
+})
+
+test('createSession does not retry unrelated Workspace creation failures', async () => {
+  const failure = new Error('model unavailable')
+  const ctx = controllerCtx(async () => {
+    throw failure
+  })
+  const host = new SessionControllerHost(ctx, { logger: { warn() {}, error() {} } })
+
+  await assert.rejects(
+    () => host.createSession({ cwd: '/tmp/project', workspaceId: 'ws-1' }),
+    (error) => error.code === 'create-failed' && error.cause === failure,
+  )
+})

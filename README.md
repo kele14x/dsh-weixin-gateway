@@ -12,6 +12,8 @@ installation, deployment, and process supervision are managed by the operator.
 - Scan a QR code once to connect your WeChat account.
 - Each WeChat chat gets its own conversation with the agent, and it resumes where
   you left off after a restart. Send `/new` to start over; the old history is kept.
+- Those conversations are grouped under one workspace in the sidebar — titled
+  `WeChat` by default — instead of showing up as “未分组”.
 - Only chats you approve can reach the agent. Pair a chat once with a code.
 - Long replies arrive as several readable messages instead of being cut off.
 - A typing indicator shows while the agent is working on your message.
@@ -102,6 +104,13 @@ Most people need no configuration: the install supplies `stateDir`, and sessions
 default to the plugin's own `workspace/` directory. Set `DSH_WEIXIN_CWD` to run
 sessions from a different directory.
 
+WeChat chats are grouped in the sidebar under a workspace titled `WeChat`. Rename
+that group in the sidebar whenever you like — the plugin keeps your name and only
+uses `workspaceTitle` when it first creates the group, so `workspaceTitle: 微信`
+gives a Chinese label on a fresh install. Set `workspaceTitle` to an empty string
+to leave new Sessions ungrouped. Pointing `DSH_WEIXIN_CWD` at a directory that
+already has a workspace groups the chats under that existing workspace.
+
 You can also set a fixed pairing code in the `DSH_WEIXIN_BIND_CODE` environment
 variable before starting the Host (rename it with `bindCodeEnv`); it is also
 single use. The full list of settings — reply chunking,
@@ -131,7 +140,7 @@ single-poller lock, retry/backoff, and `-14` handling — are in `AGENTS.md`.
 npm test
 ```
 
-472 offline tests using fake iLink/Host interfaces and disposable fixtures — no
+499 offline tests using fake iLink/Host interfaces and disposable fixtures — no
 WeChat account is used.
 
 ## Limitations

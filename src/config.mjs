@@ -18,6 +18,9 @@ import {
   SESSION_PAUSED_MS,
 } from './ilink/constants.mjs'
 
+/** Sidebar group title used when the operator configures none. */
+export const DEFAULT_WORKSPACE_TITLE = 'WeChat'
+
 /** Configuration accepted by the WeChat channel plugin. */
 export const Config = z.object({
   stateDir: z
@@ -33,6 +36,12 @@ export const Config = z.object({
   agentPreset: z
     .string()
     .description('Optional DSH agent preset for sessions this channel creates.'),
+  workspaceTitle: z
+    .string()
+    .default(DEFAULT_WORKSPACE_TITLE)
+    .description(
+      'Title of the DSH workspace that groups WeChat sessions in the sidebar. Empty leaves them ungrouped.',
+    ),
   baseUrl: z
     .string()
     .default(DEFAULT_BASE_URL)

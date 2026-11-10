@@ -48,20 +48,48 @@ export class SessionControllerHost {
   /**
    * Create one Session and return its durable id.
    *
+   * A `workspaceId` names the Workspace directly, which is what makes the new
+   * Session join it; the Session Controller then derives the directory from the
+   * Workspace. `cwd` is the directory to use when no Workspace is named and the
+   * fallback when the named Workspace disappeared mid-run.
+   *
    * @param {object} options - creation options.
    * @param {string} options.cwd - working directory the Session owns.
+   * @param {string} [options.workspaceId] - Workspace the Session joins.
    * @param {string} [options.agentPreset] - preset the Session runs.
    * @returns {Promise<string>} created Session id.
    */
-  async createSession({ cwd, agentPreset }) {
-    let value
-    try {
-      value = await this.ctx.sessionController.create({
-        cwd,
+  async createSession({ cwd, workspaceId, agentPreset }) {
+    const location = workspaceId === undefined ? { cwd } : { workspaceId }
+    const create = () =>
+      this.ctx.sessionController.create({
+        ...location,
         ...(agentPreset === undefined ? {} : { agentPreset }),
       })
+    let value
+    try {
+      value = await create()
     } catch (error) {
-      throw new HostError('create-failed', `could not create a DSH session: ${error.message}`, error)
+      if (workspaceId === undefined || error?.code !== 'workspace/not-found') {
+        throw new HostError('create-failed', `could not create a DSH session: ${error.message}`, error)
+      }
+      // The group was removed underneath a running channel. Grouping is
+      // cosmetic, so create the Session ungrouped instead of failing the turn.
+      this.logger.warn('the WeChat workspace no longer exists; creating an ungrouped Session', {
+        workspaceId,
+      })
+      try {
+        value = await this.ctx.sessionController.create({
+          cwd,
+          ...(agentPreset === undefined ? {} : { agentPreset }),
+        })
+      } catch (retryError) {
+        throw new HostError(
+          'create-failed',
+          `could not create a DSH session: ${retryError.message}`,
+          retryError,
+        )
+      }
     }
     const sessionId = value?.sessionId
     if (typeof sessionId !== 'string' || sessionId.length === 0) {

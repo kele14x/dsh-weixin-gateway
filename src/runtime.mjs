@@ -73,6 +73,7 @@ export class Gateway {
    * @param {object} [options.accounts] - account store override.
    * @param {Function} [options.clientFactory] - client factory override for tests.
    * @param {object} [options.media] - media downloader override for tests.
+   * @param {import('./bridge/workspace.mjs').WorkspaceBinder} [options.workspace] - sidebar grouping.
    * @param {number} [options.lockRetryMs] - delay before retrying a poller lock held elsewhere.
    * @param {number} [options.pauseHeartbeatMs] - lock heartbeat interval during a `-14` pause.
    */
@@ -83,12 +84,14 @@ export class Gateway {
     accounts,
     clientFactory,
     media,
+    workspace,
     lockRetryMs = 30_000,
     pauseHeartbeatMs = 60_000,
   }) {
     this.config = config
     this.host = host
     this.logger = logger
+    this.workspace = workspace
     this.accounts = accounts ?? new AccountStore({ stateDir: config.stateDir })
     this.clientFactory =
       clientFactory ??
@@ -251,6 +254,7 @@ export class Gateway {
         state: this.state,
         defaultCwd: this.config.defaultCwd,
         agentPreset: this.config.agentPreset,
+        workspace: this.workspace,
         logger: this.logger,
       })
 
