@@ -8,6 +8,34 @@ import { readdir, readFile, writeFile } from 'node:fs/promises'
 import { acquireLock, getProcessIdentity, LockError, isProcessAlive } from '../src/store/lock.mjs'
 import { makeTempDir, cleanup } from './helpers/tmp.mjs'
 
+const runFile = promisify(execFile)
+
+/**
+ * Whether this host lets the lock read the native probe inputs.
+ *
+ * Sandboxes commonly deny executing setuid binaries such as macOS `/bin/ps`,
+ * and a restricted container may hide `/proc`. The production probe then
+ * returns null on purpose and the lock falls back to heartbeat-only staleness,
+ * so the test must assert that fallback instead of a native identity.
+ *
+ * @returns {Promise<boolean>} true when the platform's probe inputs are available.
+ */
+async function nativeIdentityProbeAvailable() {
+  try {
+    if (process.platform === 'linux') {
+      await readFile('/proc/sys/kernel/random/boot_id')
+      await readFile(`/proc/${process.pid}/stat`)
+      return true
+    }
+    if (process.platform === 'darwin') {
+      await runFile('/usr/sbin/sysctl', ['-n', 'kern.bootsessionuuid'], { timeout: 2000 })
+      await runFile('/bin/ps', ['-o', 'lstart=', '-p', String(process.pid)], { timeout: 2000 })
+      return true
+    }
+  } catch {}
+  return false
+}
+
 test('a second live owner is refused', async (t) => {
   const dir = await makeTempDir('lock')
   t.after(() => cleanup(dir))
@@ -166,12 +194,15 @@ test('an old heartbeat cannot evict a live process on this host', async (t) => {
 test('native process identity is stable and persisted through heartbeats', async (t) => {
   const dir = await makeTempDir('lock-generation')
   t.after(() => cleanup(dir))
+  const probeAvailable = await nativeIdentityProbeAvailable()
   const identity = await getProcessIdentity(process.pid)
-  if (process.platform === 'linux' || process.platform === 'darwin') {
+  if (probeAvailable) {
     assert.ok(identity?.bootId)
     assert.ok(identity?.startTime)
   } else {
+    // Unverifiable identity keeps a live PID protected; it is never invented.
     assert.equal(identity, null)
+    t.diagnostic(`${process.platform}: native process identity unavailable in this environment`)
   }
   assert.deepEqual(await getProcessIdentity(process.pid), identity)
   const source = `

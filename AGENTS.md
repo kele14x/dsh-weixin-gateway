@@ -73,8 +73,10 @@ Phase 1 covers inbound images only:
   exits. Taking over a stale lock is atomic, so two starters cannot both claim it.
 - Local lock recovery compares boot identity and process start time on Linux and
   macOS to detect a reused PID. Matching or unverifiable live owners stay
-  protected regardless of heartbeat age; older locks without generation metadata
-  may still need operator inspection.
+  protected regardless of heartbeat age; when the platform probe is unavailable
+  (for example a sandbox that denies setuid `/bin/ps`), the lock keeps that
+  conservative fallback. Older locks without generation metadata may still need
+  operator inspection.
 - Long-poll or network errors: exponential backoff (1 s → 60 s), cursor kept.
 - Send errors: one retry on a plain network failure, reusing the per-chunk
   `clientId` as a server-side deduplication hint, then log; never claims success.
