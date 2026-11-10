@@ -35,6 +35,7 @@ import {
 import { acquireLock, LockError } from './store/lock.mjs'
 import { AccountStore, safeBotId } from './store/accounts.mjs'
 import { ChannelState } from './store/state.mjs'
+import { InboundJournal, inboundKey } from './store/inbound.mjs'
 import { AllowList } from './store/allowed.mjs'
 import { CommandRouter, parseCommand } from './bridge/commands.mjs'
 import { SessionRouter } from './bridge/session-router.mjs'
@@ -42,6 +43,7 @@ import { TurnCollector, joinSteps } from './bridge/turn-collector.mjs'
 
 /** Maximum characters of an upstream error message echoed to WeChat. */
 const MAX_ERROR_CHARS = 300
+const LOCAL_COMMANDS = new Set(['bind', 'help', 'version', 'status', 'new', 'stop', 'allow', 'deny'])
 
 /**
  * Shorten a value for human-facing output.
@@ -113,6 +115,8 @@ export class Gateway {
     this.client = undefined
     this.lock = undefined
     this.state = undefined
+    this.inbound = undefined
+    this.interrupted = new Map()
     this.allowed = undefined
     this.router = undefined
     this.collector = undefined
@@ -213,6 +217,9 @@ export class Gateway {
         logger: this.logger,
       })
       await this.state.load()
+      this.inbound = new InboundJournal({ stateDir: this.config.stateDir, botId: account.botId })
+      await this.inbound.load()
+      this.interrupted = new Map(this.inbound.entries().map((entry) => [inboundKey(entry.userId, entry.messageId), entry]))
 
       this.allowed = new AllowList({ stateDir: this.config.stateDir })
       await this.allowed.load()
@@ -261,11 +268,14 @@ export class Gateway {
       })
 
       this.#notifyLifecycle('notifyStart')
-      this.pollPromise = this.#pollLoop()
+      await this.#recoverInbound()
+      if (!signal.aborted) this.pollPromise = this.#pollLoop()
     } catch (error) {
       this.disposeApproval?.()
       this.disposeApproval = undefined
       this.collector?.dispose()
+      // Failed recovery writes must not be flushed after releasing ownership.
+      this.state = undefined
       await this.lock?.release().catch(() => {})
       this.lock = undefined
       if (signal.aborted) return
@@ -322,6 +332,7 @@ export class Gateway {
     await this.state?.flush().catch((error) => {
       this.logger.error('failed to flush channel state', error)
     })
+    await this.inbound?.flush()
     await this.lock?.release().catch((error) => {
       this.logger.warn('failed to release poller lock', { reason: error.message })
     })
@@ -408,12 +419,19 @@ export class Gateway {
    * Handle `/stop`: cancel the active turn and drop queued messages.
    *
    * @param {string} userId - sender id.
-   * @returns {string} reply text.
+   * @returns {Promise<string>} reply text.
    */
-  stopTurn(userId) {
+  async stopTurn(userId) {
     const active = this.active.get(userId)
+    const keys = this.inbound.entries()
+      .filter((entry) => entry.userId === userId && (active === undefined || entry.messageId !== String(active.messageId)))
+      .map((entry) => inboundKey(userId, entry.messageId))
     this.queues.delete(userId)
-    if (active === undefined) return 'Nothing is running.'
+    if (active === undefined) {
+      await this.inbound.remove(keys)
+      for (const key of keys) this.interrupted.delete(key)
+      return 'Nothing is running.'
+    }
     active.approvalsClosed = true
     this.#clearApprovals(userId, active)
     this.suppressAbort.add(userId)
@@ -431,8 +449,13 @@ export class Gateway {
     } catch (error) {
       this.suppressAbort.delete(userId)
       this.logger.error('cancellation failed', error)
+      await this.inbound.remove(keys)
+      for (const key of keys) this.interrupted.delete(key)
       return `Could not cancel the running turn: ${shorten(error.message)}`
     }
+    keys.push(inboundKey(userId, active.messageId))
+    await this.inbound.remove(keys)
+    for (const key of keys) this.interrupted.delete(key)
     return 'Stopping the current turn and clearing the queue.'
   }
 
@@ -601,6 +624,7 @@ export class Gateway {
             await this.#accept(raw)
           } catch (error) {
             if (this.abort.signal.aborted) break
+            if (error.code === 'inbound-persistence') throw error
             this.logger.error('failed to handle an inbound message', error)
             const message = normalizeInbound(raw)
             if (message) await this.#sendText(message.fromUserId, `Could not process this message: ${shorten(error.message)}`)
@@ -611,6 +635,10 @@ export class Gateway {
         }
       } catch (error) {
         if (this.abort.signal.aborted || error.code === 'aborted') break
+        if (error.code === 'inbound-persistence') {
+          this.#failInbound(error)
+          break
+        }
         if (error.code === 'locked') {
           this.logger.error('poller lock ownership was lost; stopping polling', error)
           this.status = 'error'
@@ -633,6 +661,55 @@ export class Gateway {
         }
         backoff = Math.min(backoff * 2, 60_000)
       }
+    }
+  }
+
+  #failInbound(error) {
+    this.logger.error('inbound tracking persistence failed; stopping to avoid losing messages', error)
+    this.status = 'error'
+    this.abort.abort()
+  }
+
+  async #finishInbound(userId, messageId) {
+    await this.inbound.remove([inboundKey(userId, messageId)]).catch((error) => {
+      this.logger.error('could not record inbound completion; an interruption notice may be repeated', error)
+    })
+  }
+
+  async #recoverInbound() {
+    for (const entry of this.interrupted.values()) {
+      this.state.isDuplicate(entry.userId, entry.messageId)
+      if (this.allowed.isAllowed(entry.userId) && this.state.contextTokenFor(entry.userId) === undefined && entry.contextToken) {
+        await this.state.setContextToken(entry.userId, entry.contextToken)
+      }
+    }
+    await this.state.flush()
+    for (const userId of new Set([...this.interrupted.values()].map((entry) => entry.userId))) {
+      if (this.abort.signal.aborted) return
+      await this.#notifyInterrupted(userId)
+    }
+  }
+
+  async #notifyInterrupted(userId) {
+    const entries = [...this.interrupted.entries()].filter(([, entry]) => entry.userId === userId)
+    if (entries.length === 0) return
+    if (this.allowed.isAllowed(userId)) {
+      if (!this.state.contextTokenFor(userId)) return
+      const queued = entries.filter(([, entry]) => entry.phase === 'queued').length
+      const submitted = entries.length - queued
+      const text = [
+        `The gateway restarted without a saved completion for ${entries.length} message(s).`,
+        ...(queued > 0 ? [`${queued} queued message(s) were not submitted to the agent. Please send them again.`] : []),
+        ...(submitted > 0 ? [`${submitted} message(s) may already have run actions. Check your DSH session history before resending them.`] : []),
+        'Nothing was replayed automatically.',
+      ].join('\n')
+      if (!await this.#sendText(userId, text)) return
+    }
+    try {
+      await this.inbound.remove(entries.map(([key]) => key))
+      for (const [key] of entries) this.interrupted.delete(key)
+    } catch (error) {
+      this.logger.error('could not clear an interruption notice; it may be repeated', error)
     }
   }
 
@@ -674,16 +751,30 @@ export class Gateway {
     if (message === null) return
 
     const userId = message.fromUserId
-    if (this.state.isDuplicate(userId, message.messageId)) {
-      this.logger.debug('duplicate message ignored', { userId, messageId: message.messageId })
-      return
-    }
     if (isGroupMessage(message)) {
       // Non-goal for the MVP: group traffic is ignored, not answered.
       this.logger.debug('group message ignored', { userId })
       return
     }
+    if ([...this.interrupted.values()].some((entry) => entry.userId === userId)) {
+      if (message.contextToken !== undefined) await this.state.setContextToken(userId, message.contextToken)
+      await this.#notifyInterrupted(userId)
+    }
+    if (this.inbound.has(userId, message.messageId) || this.state.hasSeen(userId, message.messageId)) {
+      this.logger.debug('duplicate message ignored', { userId, messageId: message.messageId })
+      return
+    }
+    await this.#routeInbound(message)
+    this.state.isDuplicate(userId, message.messageId)
+  }
 
+  async #routeInbound(message) {
+    const userId = message.fromUserId
+    const isAllowed = this.allowed.isAllowed(userId)
+    const command = parseCommand(message.text)
+    if (!isAllowed || (command !== null && LOCAL_COMMANDS.has(command.name))) {
+      this.state.isDuplicate(userId, message.messageId)
+    }
     if (message.contextToken !== undefined) {
       await this.state.setContextToken(userId, message.contextToken).catch((error) => {
         this.logger.error('failed to persist a context token', error)
@@ -692,8 +783,6 @@ export class Gateway {
 
     this.logger.contentDebug('inbound text', { userId, text: message.text })
 
-    const isAllowed = this.allowed.isAllowed(userId)
-    const command = parseCommand(message.text)
     if (command !== null) {
       const outcome = await this.commands.handle({ userId, command, isAllowed })
       if (outcome.handled) {
@@ -745,6 +834,12 @@ export class Gateway {
       await this.#sendText(userId, 'Still working on earlier messages. Please wait before sending more.')
       return
     }
+    await this.inbound.record(message)
+    this.state.isDuplicate(userId, message.messageId)
+    await this.state.flush().catch((cause) => {
+      throw Object.assign(new Error('Could not persist inbound message tracking.'), { code: 'inbound-persistence', cause })
+    })
+    if (this.abort.signal.aborted) return
     queue.push(message)
     this.queues.set(userId, queue)
     const draining = this.#drain(userId)
@@ -792,7 +887,7 @@ export class Gateway {
   async #runTurn(userId, message) {
     const controller = new AbortController()
     const signal = AbortSignal.any([this.abort.signal, controller.signal])
-    const active = { controller, phase: 'preparing', requestId: randomUUID(), startedAt: Date.now() }
+    const active = { controller, phase: 'preparing', messageId: message.messageId, requestId: randomUUID(), startedAt: Date.now() }
     this.active.set(userId, active)
     const onAbort = () => {
       if (active.phase === 'admitting') active.cancelDuringAdmission = true
@@ -800,6 +895,7 @@ export class Gateway {
     signal.addEventListener('abort', onAbort, { once: true })
     let turn
     let admission
+    let settled = false
     try {
       const mapping = await this.router.sessionFor(userId)
       active.sessionId = mapping.sessionId
@@ -810,6 +906,7 @@ export class Gateway {
       const typing = this.#typing(userId, true, signal)
       const images = await this.#loadImages(message, signal)
       if (signal.aborted) return
+      if (!await this.inbound.markSubmitting(userId, message.messageId) || signal.aborted) return
 
       turn = this.collector.begin({ sessionId: active.sessionId, requestId: active.requestId, signal })
       turn.promise.catch(() => {})
@@ -828,10 +925,19 @@ export class Gateway {
       })
       await Promise.race([admission, turn.promise.then(() => undefined)])
       const result = await turn.promise
+      settled = true
+      await this.#finishInbound(userId, message.messageId)
       await this.#replyToTurn(userId, result)
     } catch (error) {
       turn?.cancel('prompt-failed')
-      await this.#handleTurnError(userId, error)
+      if (error.code === 'inbound-persistence') {
+        this.#failInbound(error)
+      } else {
+        await this.#handleTurnError(userId, error)
+        if (!settled && !this.abort.signal.aborted && !active.keepActive) {
+          await this.#finishInbound(userId, message.messageId)
+        }
+      }
     } finally {
       this.#clearApprovals(userId, active)
       if (signal.aborted && this.status === 'error' && active.phase === 'running' && !active.cancelDuringAdmission) {

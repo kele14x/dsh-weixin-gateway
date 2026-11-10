@@ -326,6 +326,7 @@ async function logout(options, stateDir, accounts) {
     const state = new ChannelState({ stateDir, botId: record.botId })
     await state.load().catch(() => {})
     await rm(state.file, { force: true })
+    await rm(join(stateDir, 'inbound', `${safeBotId(record.botId)}.json`), { force: true })
     await rm(join(stateDir, 'allowed.json'), { force: true })
     await clearPairingCode(stateDir)
 

@@ -131,7 +131,7 @@ single-poller lock, retry/backoff, and `-14` handling — are in `AGENTS.md`.
 npm test
 ```
 
-324 offline tests using fake iLink/Host interfaces and disposable fixtures — no
+410 offline tests using fake iLink/Host interfaces and disposable fixtures — no
 WeChat account is used.
 
 ## Limitations
@@ -140,6 +140,14 @@ Text and image direct messages. Files, voice, video, group chats,
 streaming, and the headless `AgentHost` fallback are not implemented. Inbound
 images are supported; sending media from the agent is not.
 `maxMessageChars: 1800` is a safety budget, not a documented server limit.
+
+Accepted agent prompts have an owner-only, per-account interruption journal.
+It stores IDs, status, and reply context, not message text or images. After a
+crash or Host restart, the gateway notifies paired chats about unfinished work;
+it never replays prompts automatically. Resend queued messages, and check DSH
+session history before resending work that may already have started. Failed
+notices are retained for the next startup or message from that chat. Outgoing
+agent replies are not stored for restart delivery.
 
 ## Attribution
 

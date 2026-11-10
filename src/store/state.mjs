@@ -254,6 +254,11 @@ export class ChannelState {
     await this.flush()
   }
 
+  hasSeen(userId, messageId) {
+    const previous = this.seen.get(dedupeKey(userId, messageId))
+    return previous !== undefined && Date.now() - previous < this.dedupeTtlMs
+  }
+
   /**
    * Check and record an inbound message id.
    *

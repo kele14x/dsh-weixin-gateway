@@ -31,7 +31,10 @@ async function storeFixture(stateDir, botId = 'bot-1') {
   await writeFile(state.file, JSON.stringify({ cursor: 'stored-cursor', sessions: { sender: 'session' } }))
   const allowedPath = join(stateDir, 'allowed.json')
   await writeFile(allowedPath, JSON.stringify({ senders: ['sender'] }))
-  return [accountPath, state.file, allowedPath, accounts.activeFile]
+  const inboundPath = join(stateDir, 'inbound', `${safeBotId(botId)}.json`)
+  await mkdir(join(stateDir, 'inbound'), { recursive: true })
+  await writeFile(inboundPath, JSON.stringify({ version: 1, botId, entries: [] }))
+  return [accountPath, state.file, allowedPath, accounts.activeFile, inboundPath]
 }
 
 async function snapshot(paths) {

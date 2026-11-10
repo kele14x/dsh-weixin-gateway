@@ -79,6 +79,21 @@ test('context tokens are remembered per sender', async (t) => {
   assert.equal(reopened.contextTokenFor('user-2'), 'ctx-2')
 })
 
+test('checking a message identity does not remember or persist it', async (t) => {
+  const dir = await makeTempDir('state')
+  t.after(() => cleanup(dir))
+  const state = await loadedState(dir)
+  assert.equal(state.hasSeen('user-1', 7), false)
+  assert.equal(state.hasSeen('user-1', 7), false)
+  await state.flush()
+  await assert.rejects(readFile(state.file), { code: 'ENOENT' })
+  assert.equal(state.isDuplicate('user-1', 7), false)
+  assert.equal(state.hasSeen('user-1', 7), true)
+  assert.equal(state.hasSeen('user-2', 7), false)
+  await state.flush()
+  assert.equal((await loadedState(dir)).hasSeen('user-1', 7), true)
+})
+
 test('dedupe detects a repeated message id and keeps ids scoped per sender', async (t) => {
   const dir = await makeTempDir('state')
   t.after(() => cleanup(dir))

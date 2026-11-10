@@ -8,6 +8,7 @@ import { AccountStore } from '../src/store/accounts.mjs'
 import { AllowList } from '../src/store/allowed.mjs'
 import { issuePairingCode } from '../src/store/pairing.mjs'
 import { ChannelState } from '../src/store/state.mjs'
+import { InboundJournal } from '../src/store/inbound.mjs'
 import { acquireLock, LockError } from '../src/store/lock.mjs'
 import { createLogger } from '../src/util/log.mjs'
 import { FakeClient } from './helpers/fake-client.mjs'
@@ -642,7 +643,7 @@ test('a failed timeout cancellation retains the handle for a later stop', async 
   client.push({ msgs: [textMessage({ id: 2, text: 'queued' })] })
   await waitFor(() => gateway.queues.has('u1'))
   assert.equal(host.callsOf('prompt').length, 1)
-  assert.match(gateway.stopTurn('u1'), /Stopping/)
+  assert.match(await gateway.stopTurn('u1'), /Stopping/)
   assert.equal(host.callsOf('cancel').length, 1)
   assert.equal(gateway.active.size, 0)
   assert.equal(gateway.queues.size, 0)
@@ -662,7 +663,7 @@ for (const stage of ['getConfig', 'sendTyping', 'createSession']) {
     await gateway.start()
     client.push({ msgs: [textMessage()] })
     await waitFor(() => entered)
-    assert.match(gateway.stopTurn('u1'), /Stopping/)
+    assert.match(await gateway.stopTurn('u1'), /Stopping/)
     pending.resolve(stage === 'getConfig' ? { typingTicket: 'ticket' } : 'delayed-session')
     assert.equal(await gateway.waitForQuiet(), true)
     assert.equal(host.callsOf('prompt').length, 0)
@@ -687,7 +688,7 @@ test('a cancelled pending admission cannot cancel a later prompt in the same ses
   await gateway.start()
   client.push({ msgs: [textMessage()] })
   await waitFor(() => host.callsOf('prompt').length === 1)
-  assert.match(gateway.stopTurn('u1'), /Stopping/)
+  assert.match(await gateway.stopTurn('u1'), /Stopping/)
   client.push({ msgs: [textMessage({ id: 2, text: 'later', context: 'ctx-2' })] })
   await waitFor(() => gateway.state.contextTokenFor('u1') === 'ctx-2')
   await delay(20)
@@ -716,11 +717,11 @@ test('a failed late-admission cancellation keeps a usable stop handle', async (t
   await gateway.start()
   client.push({ msgs: [textMessage()] })
   await waitFor(() => host.callsOf('prompt').length === 1)
-  assert.match(gateway.stopTurn('u1'), /Stopping/)
+  assert.match(await gateway.stopTurn('u1'), /Stopping/)
   admission.resolve()
   await waitFor(() => gateway.draining.size === 0)
   assert.equal(gateway.active.get('u1')?.keepActive, true)
-  assert.match(gateway.stopTurn('u1'), /Stopping/)
+  assert.match(await gateway.stopTurn('u1'), /Stopping/)
   assert.equal(gateway.active.size, 0)
   assert.equal(attempts, 3)
 })
@@ -1278,7 +1279,7 @@ for (const change of ['request abort', 'stop', 'new', 'shutdown']) {
     assert.equal(gateway.approvals.size, 0)
     assert.equal(client.sent.length, 0)
     if (change === 'request abort') controller.abort()
-    if (change === 'stop') gateway.stopTurn('u1')
+    if (change === 'stop') await gateway.stopTurn('u1')
     if (change === 'new') await gateway.newSession('u1')
     if (change === 'shutdown') await gateway.stop()
     release()
@@ -1301,6 +1302,47 @@ test('permission context is bounded, localized, and excludes extra tool argument
   assert.equal(text.includes('must-not-forward'), false)
   assert.equal(text.includes('private raw reason'), false)
   assert.equal(text.includes('r'.repeat(601)), false)
-  fixture.gateway.stopTurn('u1')
+  await fixture.gateway.stopTurn('u1')
   assert.equal(await answer, 'cancelled')
 })
+
+test('failed recovery cannot flush stale state after a successor takes the lock', async (t) => {
+  const { dir, gateway } = await setup(t)
+  const journal = new InboundJournal({ stateDir: dir, botId: 'bot1' })
+  await journal.load()
+  await journal.record({ fromUserId: 'u1', messageId: 7, contextToken: 'recovery-context' })
+  const original = ChannelState.prototype.flush
+  const mocked = t.mock.method(ChannelState.prototype, 'flush', async () => { throw new Error('disk failure') })
+  await assert.rejects(gateway.start(), /disk failure/)
+  mocked.mock.restore()
+  assert.equal(ChannelState.prototype.flush, original)
+  const owner = await acquireLock(join(dir, 'lock', 'bot1.lock'))
+  t.after(() => owner.release())
+  const successor = new ChannelState({ stateDir: dir, botId: 'bot1' })
+  await successor.load()
+  await successor.setCursor('successor-cursor')
+  await gateway.stop()
+  const reopened = new ChannelState({ stateDir: dir, botId: 'bot1' })
+  await reopened.load()
+  assert.equal(reopened.cursor, 'successor-cursor')
+})
+
+for (const window of ['evicted', 'expired']) {
+  test(`pending prompt identities suppress redelivery when the dedupe window is ${window}`, async (t) => {
+    const { client, host, gateway } = await setup(t, {
+      msgs: [textMessage()], hostOptions: { autoRespond: false },
+    })
+    await gateway.start()
+    await waitFor(() => host.callsOf('prompt').length === 1)
+    if (window === 'evicted') gateway.state.seen.clear()
+    else gateway.state.dedupeTtlMs = 0
+    client.push({
+      msgs: [textMessage(), textMessage({ id: 2, text: 'later' })],
+      getUpdatesBuf: 'redelivered',
+    })
+    await waitFor(() => gateway.state.cursor === 'redelivered')
+    assert.equal(host.callsOf('prompt').length, 1)
+    assert.deepEqual(gateway.queues.get('u1').map((message) => message.messageId), [2])
+    assert.equal(gateway.inbound.entries().length, 2)
+  })
+}
