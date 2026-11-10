@@ -26,7 +26,11 @@ function persistenceError(error) {
 }
 
 const entry = { userId: 'u1', messageId: '7', phase: 'queued', acceptedAt: 123 }
+const sendingEntry = { ...entry, phase: 'sending', replyId: 'reply-1', totalChunks: 3, acknowledgedChunks: 0 }
 const document = (entries = [entry]) => ({ version: 1, botId: 'bot1', entries })
+const invalidReplyIds = [undefined, '', 7, null, false, {}, []]
+const invalidTotalChunks = [undefined, 0, -1, 0.5, Number.MAX_SAFE_INTEGER + 1, '3', null, false, {}, []]
+const invalidAcknowledgedChunks = [undefined, -1, 0.5, 4, Number.MAX_SAFE_INTEGER + 1, '1', null, false, {}, []]
 
 test('missing journal loads empty and flush and absent mutations write nothing', async (t) => {
   const { journal, stateDir } = await fixture(t)
@@ -34,6 +38,8 @@ test('missing journal loads empty and flush and absent mutations write nothing',
   assert.deepEqual(journal.entries(), [])
   assert.equal(journal.has('u1', 7), false)
   assert.equal(await journal.markSubmitting('u1', 7), false)
+  assert.equal(await journal.markSending('u1', 7, { replyId: 'reply-1', totalChunks: 3 }), false)
+  assert.equal(await journal.markAcknowledged('u1', 7, 'reply-1', 1), false)
   await journal.remove([inboundKey('u1', 7)])
   await journal.flush()
   await assert.rejects(stat(journal.file), { code: 'ENOENT' })
@@ -55,10 +61,18 @@ test('metadata roundtrips with phases and owner-only file and directory permissi
   const submitting = journal.markSubmitting('u1', 7)
   assert.equal(journal.entries()[0].phase, 'queued')
   assert.equal(await submitting, true)
+  await journal.record({ fromUserId: 'u3', messageId: '9', contextToken: '' })
+  await journal.markSubmitting('u3', 9)
+  assert.equal(await journal.markSending('u3', 9, { replyId: 'reply-3', totalChunks: 1 }), true)
+  assert.equal(await journal.markAcknowledged('u3', 9, 'reply-3', 1), true)
   const saved = JSON.parse(await readFile(journal.file, 'utf8'))
   assert.deepEqual(saved, { version: 1, botId, entries: journal.entries() })
   assert.equal(saved.entries[0].phase, 'submitting')
   assert.equal(Object.hasOwn(saved.entries[1], 'contextToken'), false)
+  assert.deepEqual(saved.entries[2], {
+    userId: 'u3', messageId: '9', phase: 'sending', contextToken: '',
+    acceptedAt: saved.entries[2].acceptedAt, replyId: 'reply-3', totalChunks: 1, acknowledgedChunks: 1,
+  })
   assert.deepEqual((await reopen(stateDir, botId)).entries(), journal.entries())
   if (process.platform !== 'win32') {
     assert.equal((await stat(journal.file)).mode & 0o777, 0o600)
@@ -91,6 +105,7 @@ test('entries are independent metadata copies and normalized payload and media s
     images: [{ full_url: 'https://cdn.example/image?secret=cdn-token', aes_key: 'secret-aes-key' }],
     content: [{ type: 'image', data: 'secret-image-bytes' }],
     botToken: 'secret-bot-token',
+    phase: 'sending', replyId: 'untrusted-reply', totalChunks: 3, acknowledgedChunks: 2,
   }
   const pending = journal.record(message)
   message.contextToken = 'changed-outside'
@@ -122,6 +137,156 @@ test('load reconstructs only explicit metadata fields, dropping unknown payload 
   await journal.markSubmitting('u1', 7)
   assert.deepEqual(JSON.parse(await readFile(journal.file, 'utf8')), document([{ ...entry, phase: 'submitting' }]))
   assert.deepEqual((await reopen(stateDir)).entries(), [{ ...entry, phase: 'submitting' }])
+})
+
+test('sending accepts only captured metadata and never persists reply bodies or caller progress', async (t) => {
+  const { journal, stateDir } = await fixture(t)
+  await journal.record({ fromUserId: 'u1', messageId: 7, contextToken: 'original-context' })
+  await journal.markSubmitting('u1', 7)
+  const previous = journal.entries()[0]
+  const reply = {
+    replyId: 'reply-1', totalChunks: 3, acknowledgedChunks: 3,
+    userId: 'replacement', messageId: 'replacement', contextToken: 'replacement', acceptedAt: 0,
+    text: 'private reply text', body: 'private reply body', chunks: ['private reply chunk'],
+    content: [{ type: 'text', text: 'private transcript' }],
+    get payload() { throw new Error('Payload must not be read') },
+  }
+  const pending = journal.markSending('u1', 7, reply)
+  reply.replyId = 'changed-outside'
+  reply.totalChunks = 99
+  assert.equal(journal.entries()[0].phase, 'submitting')
+  assert.equal(await pending, true)
+  const expected = [{ ...previous, phase: 'sending', replyId: 'reply-1', totalChunks: 3, acknowledgedChunks: 0 }]
+  const copies = journal.entries()
+  copies[0].replyId = 'tampered'
+  copies[0].totalChunks = 99
+  copies[0].acknowledgedChunks = 99
+  assert.deepEqual(journal.entries(), expected)
+  assert.deepEqual(JSON.parse(await readFile(journal.file, 'utf8')), document(expected))
+  assert.deepEqual((await reopen(stateDir)).entries(), expected)
+  await journal.markAcknowledged('u1', 7, 'reply-1', 2)
+  expected[0].acknowledgedChunks = 2
+  assert.deepEqual(JSON.parse(await readFile(journal.file, 'utf8')), document(expected))
+})
+
+test('load preserves legacy phases and reconstructs only flat sending metadata', async (t) => {
+  const { journal, stateDir } = await fixture(t)
+  const expected = [
+    entry,
+    { ...entry, userId: 'u2', phase: 'submitting', contextToken: '' },
+    { ...sendingEntry, userId: 'u3', contextToken: 'ctx3', acknowledgedChunks: 2 },
+    { ...sendingEntry, userId: 'u4', totalChunks: Number.MAX_SAFE_INTEGER, acknowledgedChunks: Number.MAX_SAFE_INTEGER },
+  ]
+  await mkdir(dirname(journal.file))
+  await writeFile(journal.file, JSON.stringify({
+    ...document(expected.map((value) => ({
+      ...value, text: 'private-text', body: 'private-body', chunks: ['private-chunk'],
+      reply: { replyId: 'nested-id', totalChunks: 99, text: 'private-reply' },
+      images: [{ aes_key: 'secret-key' }], extra: {},
+    }))),
+    payload: 'secret-document',
+  }))
+  await journal.load()
+  assert.deepEqual(journal.entries(), expected)
+  await journal.markSubmitting('u1', 7)
+  expected[0] = { ...entry, phase: 'submitting' }
+  assert.deepEqual(JSON.parse(await readFile(journal.file, 'utf8')), document(expected))
+  assert.deepEqual((await reopen(stateDir)).entries(), expected)
+})
+
+test('sending and acknowledgement lifecycle is monotonic and idempotent through completion', async (t) => {
+  const { journal, stateDir } = await fixture(t)
+  await journal.record({ fromUserId: 'u1', messageId: 7 })
+  const reply = { replyId: 'reply-1', totalChunks: 3 }
+  const queued = await readFile(journal.file, 'utf8')
+  assert.equal(await journal.markSending('u1', 7, reply), false)
+  assert.equal(await journal.markAcknowledged('u1', 7, reply.replyId, 1), false)
+  assert.equal(await readFile(journal.file, 'utf8'), queued)
+  await journal.markSubmitting('u1', 7)
+  const submitting = await readFile(journal.file, 'utf8')
+  assert.equal(await journal.markAcknowledged('u1', 7, reply.replyId, 1), false)
+  assert.equal(await readFile(journal.file, 'utf8'), submitting)
+  assert.equal(await journal.markSending('u1', 7, reply), true)
+  const sending = journal.entries()[0]
+  assert.equal(sending.acknowledgedChunks, 0)
+  for (const acknowledgedChunks of [0, 1, 3]) {
+    const before = journal.entries()
+    const pending = journal.markAcknowledged('u1', '7', reply.replyId, acknowledgedChunks)
+    assert.deepEqual(journal.entries(), before)
+    assert.equal(await pending, true)
+    const expected = [{ ...sending, acknowledgedChunks }]
+    assert.deepEqual(journal.entries(), expected)
+    const text = await readFile(journal.file, 'utf8')
+    const file = journal.file
+    journal.file = stateDir
+    assert.deepEqual(await Promise.all([
+      journal.markAcknowledged('u1', 7, reply.replyId, acknowledgedChunks),
+      journal.markSending('u1', '7', reply),
+      journal.markSubmitting('u1', 7),
+      journal.record({ fromUserId: 'u1', messageId: 7, contextToken: 'replacement' }),
+      journal.markAcknowledged('u1', 7, 'different-reply', acknowledgedChunks),
+    ]), [true, true, false, false, false])
+    journal.file = file
+    assert.deepEqual(journal.entries(), expected)
+    assert.equal(await readFile(file, 'utf8'), text)
+    assert.deepEqual((await reopen(stateDir)).entries(), expected)
+  }
+  assert.equal(journal.has('u1', 7), true)
+  await journal.remove([inboundKey('u1', 7)])
+  assert.equal(await journal.markSending('u1', 7, reply), false)
+  assert.equal(await journal.markAcknowledged('u1', 7, reply.replyId, 3), false)
+  assert.deepEqual((await reopen(stateDir)).entries(), [])
+})
+
+test('invalid sending metadata and replacement attempts reject without changing snapshots', async (t) => {
+  const { journal, stateDir } = await fixture(t)
+  await journal.record({ fromUserId: 'u1', messageId: 7 })
+  await journal.markSubmitting('u1', 7)
+  const reply = { replyId: 'reply-1', totalChunks: 3 }
+  for (const phase of ['submitting', 'sending']) {
+    if (phase === 'sending') {
+      await journal.markSending('u1', 7, reply)
+      await journal.markAcknowledged('u1', 7, reply.replyId, 2)
+    }
+    const expected = journal.entries()
+    const text = await readFile(journal.file, 'utf8')
+    for (const invalid of [
+      ...invalidReplyIds.map((replyId) => ({ ...reply, replyId })),
+      ...[...invalidTotalChunks, NaN, Infinity, -Infinity].map((totalChunks) => ({ ...reply, totalChunks })),
+      ...(phase === 'sending' ? [{ ...reply, replyId: 'replacement' }, { ...reply, totalChunks: 4 }] : []),
+    ]) {
+      await assert.rejects(journal.markSending('u1', 7, invalid))
+      assert.deepEqual(journal.entries(), expected)
+    }
+    await journal.flush()
+    assert.equal(await readFile(journal.file, 'utf8'), text)
+    assert.deepEqual((await reopen(stateDir)).entries(), expected)
+  }
+  assert.equal(await journal.markSending('u1', 7, reply), true)
+  assert.equal(await journal.markAcknowledged('u1', 7, reply.replyId, 3), true)
+})
+
+test('invalid or backward acknowledgements reject while mismatched identities remain untouched', async (t) => {
+  const { journal, stateDir } = await fixture(t)
+  await journal.record({ fromUserId: 'u1', messageId: 7 })
+  await journal.markSubmitting('u1', 7)
+  await journal.markSending('u1', 7, { replyId: 'reply-1', totalChunks: 3 })
+  await journal.markAcknowledged('u1', 7, 'reply-1', 2)
+  const expected = journal.entries()
+  const text = await readFile(journal.file, 'utf8')
+  for (const count of [...invalidAcknowledgedChunks, NaN, Infinity, -Infinity, 0, 1]) {
+    await assert.rejects(journal.markAcknowledged('u1', 7, 'reply-1', count))
+    assert.deepEqual(journal.entries(), expected)
+  }
+  for (const replyId of [...invalidReplyIds, 'different-reply']) {
+    assert.equal(await journal.markAcknowledged('u1', 7, replyId, 3), false)
+  }
+  assert.equal(await journal.markAcknowledged('u2', 7, 'reply-1', 3), false)
+  assert.equal(await journal.markAcknowledged('u1', 8, 'reply-1', 3), false)
+  await journal.flush()
+  assert.equal(await readFile(journal.file, 'utf8'), text)
+  assert.deepEqual((await reopen(stateDir)).entries(), expected)
+  assert.equal(await journal.markAcknowledged('u1', 7, 'reply-1', 3), true)
 })
 
 for (const [name, text] of [
@@ -158,8 +323,24 @@ for (const [name, text] of [
     `invalid ${field} ${JSON.stringify(value)}`,
     JSON.stringify(document([entry, { ...entry, userId: 'u2', [field]: value }])),
   ]),
+  ...[
+    ...invalidReplyIds.map((value) => ['replyId', value]),
+    ...invalidTotalChunks.map((value) => ['totalChunks', value]),
+    ...invalidAcknowledgedChunks.map((value) => ['acknowledgedChunks', value]),
+  ].map(([field, value]) => [
+    `invalid sending ${field} ${JSON.stringify(value)}`,
+    JSON.stringify(document([entry, { ...sendingEntry, userId: 'u2', [field]: value }])),
+  ]),
+  ['nested-only sending metadata', JSON.stringify(document([{
+    ...entry, phase: 'sending', reply: { replyId: 'reply-1', totalChunks: 3, acknowledgedChunks: 0 },
+  }]))],
+  ...['totalChunks', 'acknowledgedChunks'].map((field) => [
+    `infinite sending ${field}`,
+    JSON.stringify(document([{ ...sendingEntry, [field]: 'infinite' }])).replace('"infinite"', '1e400'),
+  ]),
   ['infinite timestamp', '{"version":1,"botId":"bot1","entries":[{"userId":"u1","messageId":"7","phase":"queued","acceptedAt":1e400}]}'],
   ['duplicate identities', JSON.stringify(document([entry, { ...entry, phase: 'submitting' }]))],
+  ['duplicate sending identities', JSON.stringify(document([entry, sendingEntry]))],
 ]) {
   test(`load fails closed for ${name} without replacing the document`, async (t) => {
     const { journal } = await fixture(t)
@@ -169,6 +350,8 @@ for (const [name, text] of [
     assert.deepEqual(journal.entries(), [])
     await assert.rejects(journal.record({ fromUserId: 'new-user', messageId: 99 }))
     await assert.rejects(journal.markSubmitting('u1', 7))
+    await assert.rejects(journal.markSending('u1', 7, { replyId: 'reply-1', totalChunks: 3 }))
+    await assert.rejects(journal.markAcknowledged('u1', 7, 'reply-1', 1))
     await assert.rejects(journal.remove([inboundKey('u1', 7)]))
     await journal.flush()
     assert.equal(await readFile(journal.file, 'utf8'), text)
@@ -208,17 +391,27 @@ test('failed records publish nothing, wrap the filesystem cause and leave retrie
   assert.deepEqual((await reopen(stateDir)).entries(), journal.entries())
 })
 
-for (const action of ['remove', 'submitting']) {
+for (const action of ['remove', 'submitting', 'sending', 'acknowledged', 'remove-sending']) {
   test(`failed ${action} retains live and persisted state, then retries successfully`, async (t) => {
     const { journal, stateDir } = await fixture(t)
     await journal.record({ fromUserId: 'u1', messageId: 7 })
     await journal.record({ fromUserId: 'u2', messageId: 7 })
+    if (['sending', 'acknowledged', 'remove-sending'].includes(action)) await journal.markSubmitting('u1', 7)
+    if (['acknowledged', 'remove-sending'].includes(action)) {
+      await journal.markSending('u1', 7, { replyId: 'reply-1', totalChunks: 3 })
+      await journal.markAcknowledged('u1', 7, 'reply-1', 1)
+    }
     const previous = journal.entries()
     const file = journal.file
     const text = await readFile(file, 'utf8')
-    const mutate = () => action === 'remove'
-      ? journal.remove([inboundKey('u1', 7)])
-      : journal.markSubmitting('u1', 7)
+    const mutations = {
+      remove: () => journal.remove([inboundKey('u1', 7)]),
+      submitting: () => journal.markSubmitting('u1', 7),
+      sending: () => journal.markSending('u1', 7, { replyId: 'reply-1', totalChunks: 3 }),
+      acknowledged: () => journal.markAcknowledged('u1', 7, 'reply-1', 2),
+      'remove-sending': () => journal.remove([inboundKey('u1', 7)]),
+    }
+    const mutate = mutations[action]
     journal.file = stateDir
     await assert.rejects(mutate(), persistenceError)
     await assert.rejects(mutate(), persistenceError)
@@ -228,7 +421,12 @@ for (const action of ['remove', 'submitting']) {
     assert.deepEqual((await reopen(stateDir)).entries(), previous)
     journal.file = file
     await mutate()
-    const expected = action === 'remove' ? [previous[1]] : [{ ...previous[0], phase: 'submitting' }, previous[1]]
+    const updates = {
+      submitting: { phase: 'submitting' },
+      sending: { phase: 'sending', replyId: 'reply-1', totalChunks: 3, acknowledgedChunks: 0 },
+      acknowledged: { acknowledgedChunks: 2 },
+    }
+    const expected = action.startsWith('remove') ? [previous[1]] : [{ ...previous[0], ...updates[action] }, previous[1]]
     assert.deepEqual(journal.entries(), expected)
     assert.deepEqual((await reopen(stateDir)).entries(), expected)
   })
@@ -241,10 +439,24 @@ test('concurrent sender records, phases, reloads and removals serialize without 
     const userId = `u${index}`
     pending.push(journal.record({ fromUserId: userId, messageId: 7 }))
     if (index % 2 === 0) pending.push(journal.markSubmitting(userId, 7))
+    if (index % 4 === 0) {
+      const reply = { replyId: `reply-${index}`, totalChunks: 3 }
+      pending.push(journal.markSending(userId, 7, reply))
+      pending.push(journal.markAcknowledged(userId, 7, reply.replyId, 1))
+      pending.push(journal.markSending(userId, 7, reply))
+      pending.push(journal.markAcknowledged(userId, 7, reply.replyId, 2))
+      pending.push(assert.rejects(journal.markAcknowledged(userId, 7, reply.replyId, 1)))
+      pending.push(journal.markAcknowledged(userId, 7, reply.replyId, 3))
+      pending.push(journal.markSubmitting(userId, 7).then((result) => assert.equal(result, false)))
+    }
     if (index % 5 === 0) pending.push(journal.load())
     if (index % 3 === 0) {
       pending.push(journal.remove([inboundKey(userId, 7)]))
       pending.push(journal.markSubmitting(userId, 7).then((result) => assert.equal(result, false)))
+      pending.push(journal.markSending(userId, 7, { replyId: `reply-${index}`, totalChunks: 3 })
+        .then((result) => assert.equal(result, false)))
+      pending.push(journal.markAcknowledged(userId, 7, `reply-${index}`, 3)
+        .then((result) => assert.equal(result, false)))
     }
   }
   await journal.flush()
@@ -254,7 +466,12 @@ test('concurrent sender records, phases, reloads and removals serialize without 
   for (let index = 0; index < 20; index += 1) {
     const found = entries.find((value) => value.userId === `u${index}`)
     if (index % 3 === 0) assert.equal(found, undefined)
-    else assert.equal(found.phase, index % 2 === 0 ? 'submitting' : 'queued')
+    else if (index % 4 === 0) {
+      assert.deepEqual(found, {
+        userId: `u${index}`, messageId: '7', phase: 'sending', acceptedAt: found.acceptedAt,
+        replyId: `reply-${index}`, totalChunks: 3, acknowledgedChunks: 3,
+      })
+    } else assert.equal(found.phase, index % 2 === 0 ? 'submitting' : 'queued')
   }
   assert.deepEqual((await reopen(stateDir)).entries(), entries)
 })
@@ -291,4 +508,40 @@ test('mutations on a fresh instance load existing tracking rather than overwriti
   assert.equal(fresh.has('u1', 7), true)
   assert.equal(fresh.has('u2', 8), true)
   assert.deepEqual((await reopen(stateDir)).entries(), fresh.entries())
+  await fresh.markSubmitting('u1', 7)
+  const sending = new InboundJournal({ stateDir, botId: 'bot1' })
+  assert.equal(await sending.markSending('u1', 7, { replyId: 'reply-1', totalChunks: Number.MAX_SAFE_INTEGER }), true)
+  const acknowledged = new InboundJournal({ stateDir, botId: 'bot1' })
+  assert.equal(await acknowledged.markAcknowledged('u1', 7, 'reply-1', Number.MAX_SAFE_INTEGER), true)
+  const expected = [
+    { ...fresh.entries()[0], phase: 'sending', replyId: 'reply-1', totalChunks: Number.MAX_SAFE_INTEGER, acknowledgedChunks: Number.MAX_SAFE_INTEGER },
+    fresh.entries()[1],
+  ]
+  assert.deepEqual(acknowledged.entries(), expected)
+  assert.deepEqual((await reopen(stateDir)).entries(), expected)
+})
+
+test('sending progress and removal are isolated by account for identical message and reply identities', async (t) => {
+  const { journal, stateDir } = await fixture(t)
+  const other = await reopen(stateDir, 'bot2')
+  assert.notEqual(journal.file, other.file)
+  await Promise.all([journal, other].map(async (current, index) => {
+    await current.record({ fromUserId: 'u1', messageId: 7 })
+    await current.markSubmitting('u1', 7)
+    await current.markSending('u1', 7, { replyId: 'reply-1', totalChunks: index + 3 })
+    await current.markAcknowledged('u1', 7, 'reply-1', index + 1)
+  }))
+  const expected = journal.entries()
+  const otherExpected = other.entries()
+  assert.equal(expected[0].acknowledgedChunks, 1)
+  assert.equal(otherExpected[0].acknowledgedChunks, 2)
+  assert.deepEqual((await reopen(stateDir)).entries(), expected)
+  assert.deepEqual((await reopen(stateDir, 'bot2')).entries(), otherExpected)
+  const otherText = await readFile(other.file, 'utf8')
+  await journal.markAcknowledged('u1', 7, 'reply-1', 3)
+  await journal.remove([inboundKey('u1', 7)])
+  assert.deepEqual((await reopen(stateDir)).entries(), [])
+  assert.deepEqual(other.entries(), otherExpected)
+  assert.equal(await readFile(other.file, 'utf8'), otherText)
+  assert.deepEqual((await reopen(stateDir, 'bot2')).entries(), otherExpected)
 })

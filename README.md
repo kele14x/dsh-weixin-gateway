@@ -131,7 +131,7 @@ single-poller lock, retry/backoff, and `-14` handling — are in `AGENTS.md`.
 npm test
 ```
 
-410 offline tests using fake iLink/Host interfaces and disposable fixtures — no
+472 offline tests using fake iLink/Host interfaces and disposable fixtures — no
 WeChat account is used.
 
 ## Limitations
@@ -141,13 +141,19 @@ streaming, and the headless `AgentHost` fallback are not implemented. Inbound
 images are supported; sending media from the agent is not.
 `maxMessageChars: 1800` is a safety budget, not a documented server limit.
 
-Accepted agent prompts have an owner-only, per-account interruption journal.
-It stores IDs, status, and reply context, not message text or images. After a
-crash or Host restart, the gateway notifies paired chats about unfinished work;
-it never replays prompts automatically. Resend queued messages, and check DSH
-session history before resending work that may already have started. Failed
-notices are retained for the next startup or message from that chat. Outgoing
-agent replies are not stored for restart delivery.
+Accepted agent prompts and their replies share one owner-only, per-account
+interruption journal. It stores IDs, status, reply context, and outbound chunk
+counts, never message text or images; DSH manages the conversation transcript.
+Reply text and network retries stay in memory. After a crash or Host restart,
+the gateway notifies paired chats about unfinished work or possibly incomplete
+replies, leaving already-sent chunks untouched. It never replays prompts or
+resends replies automatically. Resend queued messages, and check DSH session
+history before rerunning work that may already have started.
+
+A reply is cleared after every chunk is acknowledged. A crash before saving an
+acknowledgement can still produce a warning for a reply that actually arrived.
+Failed notices are retained for the next startup or message from that chat.
+Command replies and permission prompts are not tracked for restart delivery.
 
 ## Attribution
 

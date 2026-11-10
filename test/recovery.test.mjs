@@ -20,6 +20,7 @@ const ROOT = fileURLToPath(new URL('../', import.meta.url))
 const NOTICE = /gateway restarted without a saved completion/
 const QUEUED = /queued message\(s\) were not submitted/
 const SUBMITTED = /may already have run actions/
+const SENDING = /agent reply\/replies may be incomplete/
 
 function message({ id = 1, from = 'u1', text = 'private task', context = 'ctx-1', group } = {}) {
   return {
@@ -46,10 +47,14 @@ async function diskState(dir, botId = 'bot1') {
   return state
 }
 
-async function seed(dir, { id = 1, from = 'u1', phase = 'queued', context = 'journal-context', botId = 'bot1' } = {}) {
+async function seed(dir, { id = 1, from = 'u1', phase = 'queued', context = 'journal-context', botId = 'bot1', acknowledgedChunks = 0 } = {}) {
   const journal = await diskJournal(dir, botId)
   await journal.record(normalizeInbound(message({ id, from, context })))
-  if (phase === 'submitting') await journal.markSubmitting(from, id)
+  if (phase !== 'queued') await journal.markSubmitting(from, id)
+  if (phase === 'sending') {
+    await journal.markSending(from, id, { replyId: `reply-${id}`, totalChunks: 3 })
+    await journal.markAcknowledged(from, id, `reply-${id}`, acknowledgedChunks)
+  }
   return journal
 }
 
@@ -105,7 +110,7 @@ async function batch(fixture, msgs, cursor = 'accepted-batch') {
   await waitFor(() => fixture.gateway.state.cursor === cursor, { message: `persisted cursor ${cursor}` })
 }
 
-function notice(client, { queued = false, submitted = false, count } = {}) {
+function notice(client, { queued = false, submitted = false, sending = false, count } = {}) {
   assert.equal(client.sent.length, 1, 'one aggregated notice, not one per message')
   const text = client.sent[0].text
   assert.match(text, NOTICE)
@@ -114,6 +119,10 @@ function notice(client, { queued = false, submitted = false, count } = {}) {
   else assert.doesNotMatch(text, QUEUED)
   if (submitted) assert.match(text, SUBMITTED)
   else assert.doesNotMatch(text, SUBMITTED)
+  if (sending) {
+    assert.match(text, SENDING)
+    assert.match(text, /Replies were not saved by the gateway and will not be resent/)
+  } else assert.doesNotMatch(text, SENDING)
   if (count !== undefined) assert.ok(text.includes(`for ${count} message(s)`))
   assert.doesNotMatch(text, /private task|private queued|fake-token/)
 }
@@ -255,7 +264,7 @@ for (const stage of ['preparation', 'pending admission']) {
 }
 
 for (const failedSend of [false, true]) {
-  test(`terminal completion is removed before ${failedSend ? 'a failed' : 'a successful'} answer send and never replayed`, async (t) => {
+  test(`terminal reply is tracked before sending and ${failedSend ? 'retained after failure' : 'cleared after success'} without replay`, async (t) => {
     const f = await fixture(t)
     let beforeSend
     const send = f.client.sendMessage.bind(f.client)
@@ -267,18 +276,193 @@ for (const failedSend of [false, true]) {
     await f.gateway.start()
     await batch(f, [message()])
     assert.equal(await f.gateway.waitForQuiet(), true)
-    assert.deepEqual(beforeSend, [])
+    assert.equal(beforeSend.length, 1)
+    assert.equal(beforeSend[0].phase, 'sending')
+    assert.equal(beforeSend[0].replyId, f.host.callsOf('prompt')[0].requestId)
+    assert.equal(beforeSend[0].totalChunks, 1)
+    assert.equal(beforeSend[0].acknowledgedChunks, 0)
     assert.equal(f.client.sent.length, failedSend ? 0 : 1)
+    assert.equal((await diskJournal(f.dir)).entries().length, failedSend ? 1 : 0)
     await f.gateway.stop()
     const next = open(t, f)
     await next.gateway.start()
-    assert.deepEqual(next.client.sent, [])
+    if (failedSend) notice(next.client, { sending: true, count: 1 })
+    else assert.deepEqual(next.client.sent, [])
     await batch(next, [message()], 'redelivery')
     assert.equal(await next.gateway.waitForQuiet(), true)
+    assert.equal(next.host.callsOf('prompt').length, 0)
+    assert.equal(next.host.callsOf('create').length, 0)
+    assert.deepEqual((await diskJournal(f.dir)).entries(), [])
+  })
+}
+
+for (const failSecondChunk of [false, true]) {
+  test(`chunk progress is metadata-only and ${failSecondChunk ? 'stops at a failed chunk' : 'advances only after acknowledgements'}`, async (t) => {
+    const reply = 'abcdefghABCDEFGH12345678'
+    const f = await fixture(t, { hostOptions: { reply: () => reply }, config: { maxMessageChars: 8 } })
+    const checkpoints = []
+    const attempts = []
+    const send = f.client.sendMessage.bind(f.client)
+    f.client.sendMessage = async (options) => {
+      const entries = (await diskJournal(f.dir)).entries()
+      checkpoints.push(entries[0])
+      attempts.push(options)
+      if (failSecondChunk && attempts.length === 2) f.client.failNextSends = 2
+      return send(options)
+    }
+    if (!failSecondChunk) f.client.loseNextAcks = 1
+    await f.gateway.start()
+    await batch(f, [message()])
+    assert.equal(await f.gateway.waitForQuiet(), true)
+    assert.deepEqual(checkpoints.map((entry) => entry.acknowledgedChunks), failSecondChunk ? [0, 1, 1] : [0, 0, 1, 2])
+    assert.ok(checkpoints.every((entry) => entry.phase === 'sending' && entry.totalChunks === 3))
+    assert.equal(new Set(checkpoints.map((entry) => entry.replyId)).size, 1)
+    const retried = failSecondChunk ? 1 : 0
+    assert.equal(attempts[retried].clientId, attempts[retried + 1].clientId)
+    assert.notEqual(attempts[0].clientId, attempts[failSecondChunk ? 1 : 2].clientId)
+    assert.deepEqual(Object.keys(checkpoints[0]).sort(), ['acceptedAt', 'acknowledgedChunks', 'contextToken', 'messageId', 'phase', 'replyId', 'totalChunks', 'userId'])
+    const metadata = JSON.stringify(checkpoints)
+    for (const privateText of ['private task', reply, 'abcdefgh', 'ABCDEFGH', '12345678', 'fake-token']) {
+      assert.equal(metadata.includes(privateText), false)
+    }
+    assert.deepEqual(f.client.sent.map((sent) => sent.text), failSecondChunk ? ['abcdefgh'] : ['abcdefgh', 'abcdefgh', 'ABCDEFGH', '12345678'])
+    const retained = (await diskJournal(f.dir)).entries()
+    assert.equal(retained.length, failSecondChunk ? 1 : 0)
+    if (failSecondChunk) assert.equal(retained[0].acknowledgedChunks, 1)
+    await f.gateway.stop()
+    const next = open(t, f)
+    await next.gateway.start()
+    if (failSecondChunk) notice(next.client, { sending: true })
+    else assert.deepEqual(next.client.sent, [])
     assert.equal(next.host.callsOf('prompt').length, 0)
     assert.deepEqual((await diskJournal(f.dir)).entries(), [])
   })
 }
+
+for (const command of ['stop', 'new']) {
+  test(`/${command} during delivery ${command === 'stop' ? 'cancels' : 'preserves'} the pending reply`, async (t) => {
+    const f = await fixture(t, { hostOptions: { reply: () => 'abcdefghABCDEFGH12345678' }, config: { maxMessageChars: 8 } })
+    await f.gateway.start()
+    const pending = hold(f)
+    let checkpoint
+    const acknowledged = f.gateway.inbound.markAcknowledged.bind(f.gateway.inbound)
+    f.gateway.inbound.markAcknowledged = async (...args) => {
+      checkpoint = args
+      await pending.promise
+      return acknowledged(...args)
+    }
+    await batch(f, [message()])
+    await waitFor(() => checkpoint !== undefined)
+    assert.equal(f.client.sent.length, 1)
+    if (command === 'stop') await f.gateway.stopTurn('u1')
+    else await f.gateway.newSession('u1')
+    assert.equal((await diskJournal(f.dir)).entries().length, command === 'stop' ? 0 : 1)
+    pending.resolve()
+    assert.equal(await f.gateway.waitForQuiet(), true)
+    assert.equal(f.client.sent.length, command === 'stop' ? 1 : 3)
+    assert.deepEqual((await diskJournal(f.dir)).entries(), [])
+    await f.gateway.stop()
+    const next = open(t, f)
+    await next.gateway.start()
+    assert.deepEqual(next.client.sent, [])
+    assert.equal(next.host.callsOf('prompt').length, 0)
+  })
+}
+
+test('graceful shutdown during a chunk send retains progress for a notice after restart', async (t) => {
+  const f = await fixture(t, { hostOptions: { reply: () => 'abcdefghABCDEFGH12345678' }, config: { maxMessageChars: 8 } })
+  const send = f.client.sendMessage.bind(f.client)
+  let sending = false
+  f.client.sendMessage = async (options) => {
+    if (f.client.sent.length === 0) return send(options)
+    sending = true
+    return new Promise((resolve, reject) => {
+      options.signal.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), { code: 'aborted' })), { once: true })
+    })
+  }
+  await f.gateway.start()
+  await batch(f, [message()])
+  await waitFor(() => sending)
+  await f.gateway.stop()
+  assert.equal(f.client.sent.length, 1)
+  const [entry] = (await diskJournal(f.dir)).entries()
+  assert.equal(entry.phase, 'sending')
+  assert.equal(entry.acknowledgedChunks, 1)
+  const next = open(t, f)
+  await next.gateway.start()
+  notice(next.client, { sending: true })
+  assert.equal(next.host.callsOf('prompt').length, 0)
+  assert.deepEqual((await diskJournal(f.dir)).entries(), [])
+})
+
+for (const reason of ['completed', 'aborted', 'max-tokens', 'error', 'blocked', 'interrupted', 'forked', 'other']) {
+  test(`a ${reason} turn with no model text tracks its fallback reply`, async (t) => {
+    const f = await fixture(t, { hostOptions: { autoRespond: false, reply: () => '' } })
+    await f.gateway.start()
+    await batch(f, [message()])
+    await waitFor(() => f.host.callsOf('prompt').length === 1)
+    f.client.failNextSends = 2
+    f.host.emitTurn({ ...f.host.callsOf('prompt')[0], reason })
+    assert.equal(await f.gateway.waitForQuiet(), true)
+    const [entry] = (await diskJournal(f.dir)).entries()
+    assert.equal(entry.phase, 'sending')
+    assert.equal(entry.totalChunks, 1)
+    assert.equal(entry.acknowledgedChunks, 0)
+    await f.gateway.stop()
+    const next = open(t, f)
+    await next.gateway.start()
+    notice(next.client, { sending: true })
+    assert.equal(next.host.callsOf('prompt').length, 0)
+  })
+}
+
+test('mixed recovery phases aggregate per sender and fully acknowledged replies need no warning', async (t) => {
+  const f = await fixture(t)
+  const allowed = new AllowList({ stateDir: f.dir })
+  await allowed.load()
+  await allowed.allow('u2')
+  await seed(f.dir)
+  await seed(f.dir, { id: 2, phase: 'submitting' })
+  await seed(f.dir, { id: 3, phase: 'sending', acknowledgedChunks: 1 })
+  await seed(f.dir, { id: 4, phase: 'sending', acknowledgedChunks: 3 })
+  await seed(f.dir, { from: 'u2', phase: 'sending', acknowledgedChunks: 2, context: 'u2-context' })
+  await seed(f.dir, { botId: 'bot2', phase: 'sending' })
+  await f.gateway.start()
+  assert.equal(f.client.sent.length, 2)
+  notice({ sent: f.client.sent.filter((sent) => sent.toUserId === 'u1') }, { queued: true, submitted: true, sending: true, count: 3 })
+  notice({ sent: f.client.sent.filter((sent) => sent.toUserId === 'u2') }, { sending: true, count: 1 })
+  assert.equal(f.client.sent.find((sent) => sent.toUserId === 'u2').contextToken, 'u2-context')
+  assert.equal(f.host.callsOf('prompt').length, 0)
+  assert.equal(f.host.callsOf('create').length, 0)
+  assert.deepEqual((await diskJournal(f.dir)).entries(), [])
+  assert.equal((await diskJournal(f.dir, 'bot2')).entries().length, 1)
+})
+
+test('fully acknowledged or revoked delivery records are cleared without a send or reply context', async (t) => {
+  const f = await fixture(t)
+  await seed(f.dir, { phase: 'sending', acknowledgedChunks: 3, context: '' })
+  await seed(f.dir, { from: 'revoked', phase: 'sending', context: 'revoked-context' })
+  await f.gateway.start()
+  assert.deepEqual(f.client.sent, [])
+  assert.deepEqual((await diskJournal(f.dir)).entries(), [])
+  assert.equal(f.gateway.interrupted.size, 0)
+  assert.equal(f.host.callsOf('prompt').length, 0)
+})
+
+test('a failed outbound interruption notice retains metadata until a fresh context retries it', async (t) => {
+  const f = await fixture(t)
+  await seed(f.dir, { phase: 'sending', acknowledgedChunks: 1 })
+  f.client.failNextSends = 2
+  await f.gateway.start()
+  assert.equal(f.gateway.interrupted.size, 1)
+  assert.equal((await diskJournal(f.dir)).entries()[0].acknowledgedChunks, 1)
+  await batch(f, [message({ context: 'fresh-context' })])
+  notice(f.client, { sending: true })
+  assert.equal(f.client.sent[0].contextToken, 'fresh-context')
+  assert.equal(f.host.callsOf('prompt').length, 0)
+  assert.equal(f.gateway.interrupted.size, 0)
+  assert.deepEqual((await diskJournal(f.dir)).entries(), [])
+})
 
 test('failed startup notice sends keep metadata for the next startup', async (t) => {
   const f = await fixture(t)
@@ -466,27 +650,60 @@ test('failed submission tracking retains accepted work even after the cursor adv
   assert.equal(cursorAtFailure, 'submission-batch', 'the accepted record remains recoverable after cursor advancement')
 })
 
-test('failed completion removal logs but sends the true answer and retains a conservative notice', async (t) => {
+test('failed completion removal retains acknowledged delivery and recovery does not warn or resend', async (t) => {
   const logs = []
   const logger = createLogger({ level: 'debug', sink: { log: (line) => logs.push(line), error: (line) => logs.push(line) } })
-  const f = await fixture(t, { hostOptions: { autoRespond: false }, logger })
+  const f = await fixture(t, { logger })
   await f.gateway.start()
+  const remove = f.gateway.inbound.remove.bind(f.gateway.inbound)
+  let restore
+  f.gateway.inbound.remove = async (...args) => {
+    restore = await blockJournal(f)
+    return remove(...args)
+  }
   await batch(f, [message()])
-  await waitFor(() => f.host.callsOf('prompt').length === 1)
-  const restore = await blockJournal(f)
-  f.host.emitTurn({ ...f.host.callsOf('prompt')[0], text: 'actual completed work' })
-  await waitFor(() => f.client.sent.length === 1)
   assert.equal(await f.gateway.waitForQuiet(), true)
-  assert.equal(f.client.sent[0].text, 'echo:actual completed work')
+  assert.equal(f.client.sent[0].text, 'echo:private task')
   assert.match(logs.join('\n'), /could not record inbound completion/)
-  assert.equal(f.gateway.inbound.has('u1', 1), true)
+  assert.equal(f.gateway.inbound.entries()[0].acknowledgedChunks, 1)
   await restore()
   await f.gateway.stop()
   const next = open(t, f)
   await next.gateway.start()
-  notice(next.client, { submitted: true })
+  assert.deepEqual(next.client.sent, [])
+  assert.deepEqual((await diskJournal(f.dir)).entries(), [])
   assert.equal(next.host.callsOf('prompt').length, 0)
 })
+
+for (const stage of ['sending', 'acknowledged']) {
+  test(`failed ${stage} persistence stops delivery and retains the last durable phase`, async (t) => {
+    const f = await fixture(t, { hostOptions: { reply: () => 'abcdefghABCDEFGH12345678' }, config: { maxMessageChars: 8 } })
+    await f.gateway.start()
+    const method = stage === 'sending' ? 'markSending' : 'markAcknowledged'
+    const mutate = f.gateway.inbound[method].bind(f.gateway.inbound)
+    let restore
+    f.gateway.inbound[method] = async (...args) => {
+      restore = await blockJournal(f)
+      return mutate(...args)
+    }
+    await batch(f, [message()])
+    await waitFor(() => f.gateway.status === 'error')
+    assert.equal(await f.gateway.waitForQuiet(), true)
+    assert.equal(f.gateway.abort.signal.aborted, true)
+    assert.equal(f.host.callsOf('prompt').length, 1)
+    assert.equal(f.host.callsOf('cancel').length, 0, 'the settled agent turn must not be cancelled after a delivery failure')
+    assert.equal(f.client.sent.length, stage === 'sending' ? 0 : 1)
+    await restore()
+    const [entry] = (await diskJournal(f.dir)).entries()
+    assert.equal(entry.phase, stage === 'sending' ? 'submitting' : 'sending')
+    if (stage === 'acknowledged') assert.equal(entry.acknowledgedChunks, 0)
+    await f.gateway.stop()
+    const next = open(t, f)
+    await next.gateway.start()
+    notice(next.client, { submitted: stage === 'sending', sending: stage === 'acknowledged' })
+    assert.equal(next.host.callsOf('prompt').length, 0)
+  })
+}
 
 for (const failedCancellation of [false, true]) {
   test(`timeout ${failedCancellation ? 'with failed cancellation retains' : 'with handled cancellation removes'} inbound tracking`, async (t) => {
@@ -578,6 +795,7 @@ function crashScript() {
     import { FakeHost } from ${url('./helpers/fake-host.mjs')};
     const dir = process.env.RECOVERY_TEST_DIR;
     const phase = process.env.RECOVERY_TEST_PHASE;
+    const sending = phase.startsWith('sending-');
     const ready = Promise.withResolvers();
     const seam = Promise.withResolvers();
     const messages = [1, 2].map((id) => ({
@@ -587,27 +805,45 @@ function crashScript() {
     const client = new FakeClient({ batches: [{ msgs: messages, getUpdatesBuf: 'crash-checkpoint' }] });
     const poll = client.getUpdates.bind(client);
     client.getUpdates = async (options) => { await ready.promise; return poll(options); };
-    const host = new FakeHost({ autoRespond: false });
+    const host = new FakeHost({ autoRespond: sending, reply: () => 'abcdefghABCDEFGH12345678' });
     if (phase === 'queued') {
       host.createSession = async () => { seam.resolve(); return new Promise(() => {}); };
-    } else {
+    } else if (!sending) {
       const prompt = host.prompt.bind(host);
       host.prompt = async (options) => { await prompt(options); seam.resolve(); };
     }
+    if (sending && phase !== 'sending-complete') {
+      const send = client.sendMessage.bind(client);
+      client.sendMessage = async (options) => {
+        if ((phase === 'sending-before-first' && client.sent.length === 0) || (phase === 'sending-partial' && client.sent.length === 1)) {
+          seam.resolve();
+          return new Promise(() => {});
+        }
+        const receipt = await send(options);
+        if (phase === 'sending-unacknowledged' && client.sent.length === 3) {
+          seam.resolve();
+          return new Promise(() => {});
+        }
+        return receipt;
+      };
+    }
     const gateway = new Gateway({
-      config: { ...${JSON.stringify({ defaultCwd: ROOT, baseUrl: 'https://fake.test', mediaEnabled: false, maxMessageChars: 1800, chunkDelayMs: 1, pollTimeoutMs: 100, queueLimit: 4, turnTimeoutMs: 60000, bindCodeEnv: '', replyMode: 'all', sessionPauseMs: 10 })}, stateDir: dir },
+      config: { ...${JSON.stringify({ defaultCwd: ROOT, baseUrl: 'https://fake.test', mediaEnabled: false, maxMessageChars: 1800, chunkDelayMs: 1, pollTimeoutMs: 100, queueLimit: 4, turnTimeoutMs: 60000, bindCodeEnv: '', replyMode: 'all', sessionPauseMs: 10 })}, stateDir: dir, maxMessageChars: sending ? 8 : 1800 },
       host, accounts: new AccountStore({ stateDir: dir }), clientFactory: () => client,
     });
     // IPC keeps the fake long poll alive; no temp helper or shutdown hook runs here.
     process.on('message', () => {});
     await gateway.start();
+    if (phase === 'sending-complete') {
+      gateway.inbound.remove = async () => { seam.resolve(); return new Promise(() => {}); };
+    }
     const setCursor = gateway.state.setCursor.bind(gateway.state);
     gateway.state.setCursor = async (cursor) => {
       await setCursor(cursor);
       await seam.promise;
       const journal = JSON.parse(await readFile(gateway.inbound.file, 'utf8'));
       const state = JSON.parse(await readFile(gateway.state.file, 'utf8'));
-      process.send({ type: 'checkpoint', journal, state, prompts: host.callsOf('prompt').length });
+      process.send({ type: 'checkpoint', journal, state, prompts: host.callsOf('prompt').length, sent: client.sent.length });
     };
     ready.resolve();
   `
@@ -637,7 +873,8 @@ async function hardKill(fixture, phase) {
     ])
     assert.equal(checkpoint.type, 'checkpoint')
     assert.equal(checkpoint.state.cursor, 'crash-checkpoint', 'IPC follows the actual durable cursor write')
-    assert.deepEqual(checkpoint.journal.entries.map((entry) => entry.phase), phase === 'queued' ? ['queued', 'queued'] : ['submitting', 'queued'])
+    const storedPhase = phase.startsWith('sending-') ? 'sending' : phase
+    assert.deepEqual(checkpoint.journal.entries.map((entry) => entry.phase), [storedPhase, 'queued'])
     assert.equal(checkpoint.prompts, phase === 'queued' ? 0 : 1)
     const lock = await json(join(fixture.dir, 'lock', 'bot1.lock'))
     assert.equal(lock.pid, child.pid, 'only the child owns the crash fixture lock')
@@ -654,6 +891,41 @@ async function hardKill(fixture, phase) {
       child.stderr.destroy()
     }
   }
+}
+
+for (const [phase, acknowledgedChunks, receivedChunks] of [
+  ['sending-before-first', 0, 0],
+  ['sending-partial', 1, 1],
+  ['sending-unacknowledged', 2, 3],
+  ['sending-complete', 3, 3],
+]) {
+  test(`SIGKILL ${phase} recovery leaves partial replies untouched and never replays work`, async (t) => {
+    const f = await fixture(t)
+    const checkpoint = await hardKill(f, phase)
+    assert.equal(checkpoint.sent, receivedChunks)
+    const journal = await diskJournal(f.dir)
+    const [entry] = journal.entries()
+    assert.equal(entry.phase, 'sending')
+    assert.equal(entry.totalChunks, 3)
+    assert.equal(entry.acknowledgedChunks, acknowledgedChunks)
+    assert.equal(typeof entry.replyId, 'string')
+    assert.doesNotMatch(await readFile(journal.file, 'utf8'), /abcdefgh|ABCDEFGH|12345678|private task/)
+    const next = open(t, f)
+    await next.gateway.start()
+    assert.equal(next.gateway.status, 'running')
+    notice(next.client, { queued: true, sending: acknowledgedChunks < 3, count: acknowledgedChunks < 3 ? 2 : 1 })
+    assert.equal(next.host.callsOf('prompt').length, 0)
+    assert.equal(next.host.callsOf('create').length, 0)
+    assert.deepEqual((await diskJournal(f.dir)).entries(), [])
+    await batch(next, [message(), message({ id: 2 })], 'crashed-redelivery')
+    assert.equal(await next.gateway.waitForQuiet(), true)
+    assert.equal(next.host.callsOf('prompt').length, 0)
+    assert.equal(next.client.sent.length, 1)
+    await next.gateway.stop()
+    const clean = open(t, f)
+    await clean.gateway.start()
+    assert.deepEqual(clean.client.sent, [])
+  })
 }
 
 for (const phase of ['queued', 'submitting']) {

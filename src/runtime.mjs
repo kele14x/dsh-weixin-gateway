@@ -693,14 +693,17 @@ export class Gateway {
   async #notifyInterrupted(userId) {
     const entries = [...this.interrupted.entries()].filter(([, entry]) => entry.userId === userId)
     if (entries.length === 0) return
-    if (this.allowed.isAllowed(userId)) {
+    const unfinished = entries.filter(([, entry]) => entry.phase !== 'sending' || entry.acknowledgedChunks < entry.totalChunks)
+    if (unfinished.length > 0 && this.allowed.isAllowed(userId)) {
       if (!this.state.contextTokenFor(userId)) return
-      const queued = entries.filter(([, entry]) => entry.phase === 'queued').length
-      const submitted = entries.length - queued
+      const queued = unfinished.filter(([, entry]) => entry.phase === 'queued').length
+      const submitted = unfinished.filter(([, entry]) => entry.phase === 'submitting').length
+      const sending = unfinished.filter(([, entry]) => entry.phase === 'sending').length
       const text = [
-        `The gateway restarted without a saved completion for ${entries.length} message(s).`,
+        `The gateway restarted without a saved completion for ${unfinished.length} message(s).`,
         ...(queued > 0 ? [`${queued} queued message(s) were not submitted to the agent. Please send them again.`] : []),
         ...(submitted > 0 ? [`${submitted} message(s) may already have run actions. Check your DSH session history before resending them.`] : []),
+        ...(sending > 0 ? [`${sending} agent reply/replies may be incomplete. Check your DSH session history before rerunning any work. Replies were not saved by the gateway and will not be resent.`] : []),
         'Nothing was replayed automatically.',
       ].join('\n')
       if (!await this.#sendText(userId, text)) return
@@ -926,8 +929,11 @@ export class Gateway {
       await Promise.race([admission, turn.promise.then(() => undefined)])
       const result = await turn.promise
       settled = true
-      await this.#finishInbound(userId, message.messageId)
-      await this.#replyToTurn(userId, result)
+      const sent = await this.#replyToTurn(userId, result, {
+        signal,
+        delivery: { messageId: message.messageId, replyId: active.requestId },
+      })
+      if (sent) await this.#finishInbound(userId, message.messageId)
     } catch (error) {
       turn?.cancel('prompt-failed')
       if (error.code === 'inbound-persistence') {
@@ -940,7 +946,7 @@ export class Gateway {
       }
     } finally {
       this.#clearApprovals(userId, active)
-      if (signal.aborted && this.status === 'error' && active.phase === 'running' && !active.cancelDuringAdmission) {
+      if (!settled && signal.aborted && this.status === 'error' && active.phase === 'running' && !active.cancelDuringAdmission) {
         try {
           this.host.cancel({ sessionId: active.sessionId })
         } catch (error) {
@@ -1013,48 +1019,32 @@ export class Gateway {
    *
    * @param {string} userId - sender id.
    * @param {object} result - collector result.
-   * @returns {Promise<void>} resolves after sending.
+   * @returns {Promise<boolean>} true after sending or an explicitly suppressed reply.
    */
-  async #replyToTurn(userId, result) {
+  async #replyToTurn(userId, result, options) {
     const text = joinSteps(result.steps, this.config.replyMode)
+    const send = (reply) => this.#sendText(userId, reply, options)
 
     switch (result.reason) {
       case 'completed':
-        if (text.length > 0) await this.#sendText(userId, text)
-        else await this.#sendText(userId, 'Done — the agent finished without text output.')
-        return
+        return send(text.length > 0 ? text : 'Done — the agent finished without text output.')
       case 'aborted':
-        if (this.suppressAbort.delete(userId)) return
-        await this.#sendText(userId, text.length > 0 ? `${text}\n\n(turn stopped)` : 'Turn stopped.')
-        return
+        if (this.suppressAbort.delete(userId)) return true
+        return send(text.length > 0 ? `${text}\n\n(turn stopped)` : 'Turn stopped.')
       case 'max-tokens':
-        await this.#sendText(
-          userId,
-          text.length > 0 ? `${text}\n\n(response hit the output limit)` : 'The response hit the output limit.',
-        )
-        return
+        return send(text.length > 0 ? `${text}\n\n(response hit the output limit)` : 'The response hit the output limit.')
       case 'error': {
         const reason = result.reasonDetail?.error?.message ?? 'unknown error'
-        await this.#sendText(
-          userId,
-          `${text.length > 0 ? `${text}\n\n` : ''}The agent turn failed: ${shorten(reason)}`,
-        )
-        return
+        return send(`${text.length > 0 ? `${text}\n\n` : ''}The agent turn failed: ${shorten(reason)}`)
       }
       case 'blocked':
-        await this.#sendText(userId, 'The turn was blocked before producing a reply.')
-        return
+        return send('The turn was blocked before producing a reply.')
       case 'interrupted':
-        await this.#sendText(
-          userId,
-          'The turn was interrupted (for example by a Host restart). Send the message again or /new.',
-        )
-        return
+        return send('The turn was interrupted (for example by a Host restart). Send the message again or /new.')
       case 'forked':
-        await this.#sendText(userId, 'The turn was closed by a session fork.')
-        return
+        return send('The turn was closed by a session fork.')
       default:
-        await this.#sendText(userId, `The turn ended (${result.reason}).`)
+        return send(`The turn ended (${result.reason}).`)
     }
   }
 
@@ -1165,15 +1155,20 @@ export class Gateway {
    * @param {AbortSignal} [options.signal] - withdraw an obsolete permission prompt.
    * @returns {Promise<boolean>} true only when every chunk was accepted.
    */
-  async #sendText(userId, text, { signal = this.abort?.signal } = {}) {
-    if (typeof text !== 'string' || text.length === 0) return false
+  async #sendText(userId, text, { signal = this.abort?.signal, delivery } = {}) {
+    if (typeof text !== 'string' || text.length === 0 || signal?.aborted) return false
     const chunks = splitText(text, this.config.maxMessageChars)
     if (chunks.length === 0) return false
+    if (delivery && !await this.inbound.markSending(userId, delivery.messageId, {
+      replyId: delivery.replyId,
+      totalChunks: chunks.length,
+    })) return false
 
     for (let index = 0; index < chunks.length; index += 1) {
       if (signal?.aborted) return false
       const sent = await this.#sendChunk(userId, chunks[index], signal)
       if (!sent) return false
+      if (delivery && !await this.inbound.markAcknowledged(userId, delivery.messageId, delivery.replyId, index + 1)) return false
       if (index < chunks.length - 1) {
         try {
           await sleep(this.config.chunkDelayMs, signal)

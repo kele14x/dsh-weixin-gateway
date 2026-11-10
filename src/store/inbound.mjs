@@ -13,9 +13,15 @@ function validateEntry(entry) {
     entry === null || typeof entry !== 'object' || Array.isArray(entry) ||
     typeof entry.userId !== 'string' || entry.userId.length === 0 ||
     typeof entry.messageId !== 'string' || entry.messageId.length === 0 ||
-    !['queued', 'submitting'].includes(entry.phase) ||
+    !['queued', 'submitting', 'sending'].includes(entry.phase) ||
     !Number.isSafeInteger(entry.acceptedAt) || entry.acceptedAt < 0 ||
-    (Object.hasOwn(entry, 'contextToken') && typeof entry.contextToken !== 'string')
+    (Object.hasOwn(entry, 'contextToken') && typeof entry.contextToken !== 'string') ||
+    (entry.phase === 'sending' && (
+      typeof entry.replyId !== 'string' || entry.replyId.length === 0 ||
+      !Number.isSafeInteger(entry.totalChunks) || entry.totalChunks <= 0 ||
+      !Number.isSafeInteger(entry.acknowledgedChunks) || entry.acknowledgedChunks < 0 ||
+      entry.acknowledgedChunks > entry.totalChunks
+    ))
   ) {
     throw new Error('Invalid inbound message tracking.')
   }
@@ -25,6 +31,11 @@ function validateEntry(entry) {
     phase: entry.phase,
     ...(Object.hasOwn(entry, 'contextToken') ? { contextToken: entry.contextToken } : {}),
     acceptedAt: entry.acceptedAt,
+    ...(entry.phase === 'sending' ? {
+      replyId: entry.replyId,
+      totalChunks: entry.totalChunks,
+      acknowledgedChunks: entry.acknowledgedChunks,
+    } : {}),
   }
 }
 
@@ -80,10 +91,50 @@ export class InboundJournal {
     return this.#mutate(async () => {
       const key = inboundKey(userId, messageId)
       const entry = this.#entries.get(key)
-      if (entry === undefined) return false
+      if (entry === undefined || entry.phase === 'sending') return false
       if (entry.phase === 'submitting') return true
       const entries = new Map(this.#entries)
       entries.set(key, { ...entry, phase: 'submitting' })
+      await this.#persist(entries)
+      return true
+    })
+  }
+
+  markSending(userId, messageId, { replyId, totalChunks }) {
+    return this.#mutate(async () => {
+      const key = inboundKey(userId, messageId)
+      const entry = this.#entries.get(key)
+      if (entry === undefined || entry.phase === 'queued') return false
+      const sending = validateEntry({
+        ...entry, phase: 'sending', replyId, totalChunks, acknowledgedChunks: 0,
+      })
+      if (entry.phase === 'sending') {
+        if (entry.replyId !== replyId || entry.totalChunks !== totalChunks) {
+          throw new Error('Cannot replace inbound reply tracking.')
+        }
+        return true
+      }
+      const entries = new Map(this.#entries)
+      entries.set(key, sending)
+      await this.#persist(entries)
+      return true
+    })
+  }
+
+  markAcknowledged(userId, messageId, replyId, acknowledgedChunks) {
+    return this.#mutate(async () => {
+      const key = inboundKey(userId, messageId)
+      const entry = this.#entries.get(key)
+      if (entry?.phase !== 'sending' || entry.replyId !== replyId) return false
+      if (
+        !Number.isSafeInteger(acknowledgedChunks) ||
+        acknowledgedChunks < entry.acknowledgedChunks || acknowledgedChunks > entry.totalChunks
+      ) {
+        throw new Error('Invalid inbound reply acknowledgement.')
+      }
+      if (entry.acknowledgedChunks === acknowledgedChunks) return true
+      const entries = new Map(this.#entries)
+      entries.set(key, { ...entry, acknowledgedChunks })
       await this.#persist(entries)
       return true
     })
