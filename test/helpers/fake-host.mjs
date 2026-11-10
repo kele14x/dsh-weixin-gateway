@@ -24,6 +24,7 @@ export class FakeHost {
     this.reply = reply
     this.calls = []
     this.listeners = new Set()
+    this.approvalListeners = new Set()
     this.turn = 1
     this.created = 0
   }
@@ -106,6 +107,21 @@ export class FakeHost {
   observe(handler) {
     this.listeners.add(handler)
     return () => this.listeners.delete(handler)
+  }
+
+  /** Register an answerer; undefined delegates to another Host surface. */
+  onApproval(handler) {
+    this.approvalListeners.add(handler)
+    return () => this.approvalListeners.delete(handler)
+  }
+
+  /** Exercise the live approval seam with the bridge's normalized payload. */
+  async requestApproval(request) {
+    for (const listener of this.approvalListeners) {
+      const outcome = listener(request)
+      if (outcome !== undefined) return await outcome
+    }
+    return 'unavailable'
   }
 
   /**

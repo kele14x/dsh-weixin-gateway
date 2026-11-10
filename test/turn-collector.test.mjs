@@ -37,6 +37,43 @@ function assistantStep(host, sessionId, turn, step, content) {
   })
 }
 
+test('isActiveTurn gates approvals on the matched prompt and currently open turn', async () => {
+  const host = new FakeHost()
+  const collector = new TurnCollector({ timeoutMs: 2000 })
+  collector.attach(host)
+  const identity = { sessionId: 's1', requestId: 'r1' }
+  const handle = collector.begin(identity)
+  assert.equal(collector.isActiveTurn(identity), false)
+  host.emit('s1', { type: 'turn/start', data: { turn: 1 } })
+  assert.equal(collector.isActiveTurn(identity), false)
+  host.emit('s1', { type: 'user/message', data: { source: { rpcId: 'desktop' } } })
+  assert.equal(collector.isActiveTurn(identity), false)
+  host.emit('s1', { type: 'user/message', data: { source: { rpcId: 'r1' } } })
+  assert.equal(collector.isActiveTurn(identity), true)
+  assert.equal(collector.isActiveTurn({ sessionId: 's2', requestId: 'r1' }), false)
+  assert.equal(collector.isActiveTurn({ sessionId: 's1', requestId: 'r2' }), false)
+  host.emit('s1', { type: 'turn/start', data: { turn: 2 } })
+  assert.equal(collector.isActiveTurn(identity), false)
+  host.emit('s1', { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } })
+  assert.equal(collector.isActiveTurn(identity), false)
+  await handle.promise
+  collector.dispose()
+})
+
+test('a cancelled collector handle is no longer eligible for approval', async () => {
+  const host = new FakeHost()
+  const collector = new TurnCollector()
+  collector.attach(host)
+  const identity = { sessionId: 's1', requestId: 'r1' }
+  const handle = collector.begin(identity)
+  openTurn(host, 's1', 'r1', 1)
+  assert.equal(collector.isActiveTurn(identity), true)
+  handle.cancel()
+  assert.equal(collector.isActiveTurn(identity), false)
+  await assert.rejects(handle.promise, { code: 'local-cancel' })
+  collector.dispose()
+})
+
 test('collects every assistant step of the correlated turn', async () => {
   const host = new FakeHost()
   const collector = new TurnCollector({ timeoutMs: 2000 })

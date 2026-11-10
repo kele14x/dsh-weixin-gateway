@@ -11,6 +11,9 @@
 
 import { silentLogger } from '../util/log.mjs'
 
+/** @typedef {'allowed-once'|'rejected'|'cancelled'|'unavailable'} ApprovalOutcome */
+const APPROVAL_OUTCOMES = new Set(['allowed-once', 'rejected', 'cancelled', 'unavailable'])
+
 /** Raised when the Host cannot satisfy a bridge operation. */
 export class HostError extends Error {
   /**
@@ -98,6 +101,52 @@ export class SessionControllerHost {
    */
   cancel({ sessionId }) {
     this.ctx.sessionController.cancel({ sessionId })
+  }
+
+  /**
+   * Route approval requests before the Host's UI relay.
+   *
+   * The handler must decide ownership synchronously: undefined delegates to the
+   * next waterfall listener; any other return value claims the request. Claimed
+   * failures and invalid outcomes fail closed without logging request content.
+   *
+   * @param {(payload: {sessionId: string, toolName: string, callId?: string, reason?: string, displayReason?: object, signal?: AbortSignal}) => (ApprovalOutcome|Promise<ApprovalOutcome>|undefined)} handler - approval router.
+   * @returns {() => void} subscription disposer.
+   */
+  onApproval(handler) {
+    return this.ctx.on(
+      'approval/request',
+      (req, next) => {
+        const sessionId = req?.agent?.session?.id
+        if (sessionId === undefined || sessionId === null || sessionId === '') return next()
+
+        let outcome
+        try {
+          outcome = handler({
+            sessionId: String(sessionId),
+            toolName: req.toolName,
+            callId: req.callId,
+            reason: req.reason,
+            displayReason: req.displayReason,
+            signal: req.signal,
+          })
+        } catch {
+          this.logger.error('approval handler failed')
+          return 'unavailable'
+        }
+
+        // Delegation stays outside the catch: downstream failures are not ours.
+        if (outcome === undefined) return next()
+        return Promise.resolve(outcome).then(
+          (value) => APPROVAL_OUTCOMES.has(value) ? value : 'unavailable',
+          () => {
+            this.logger.error('approval handler failed')
+            return 'unavailable'
+          },
+        )
+      },
+      { global: true, prepend: true },
+    )
   }
 
   /**

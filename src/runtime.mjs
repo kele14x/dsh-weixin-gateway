@@ -116,6 +116,9 @@ export class Gateway {
     this.allowed = undefined
     this.router = undefined
     this.collector = undefined
+    this.disposeApproval = undefined
+    /** @type {Map<string, object>} live permission requests; never persisted or replayed */
+    this.approvals = new Map()
     this.commands = undefined
     this.abort = undefined
     this.pollPromise = undefined
@@ -240,11 +243,14 @@ export class Gateway {
           stop: (userId) => this.stopTurn(userId),
           newSession: (userId) => this.newSession(userId),
           version: () => `dsh-weixin-gateway ${VERSION} (iLink protocol reference 2.4.10)`,
+          approval: (userId, response) => this.respondApproval(userId, response),
         },
         allowed: this.allowed,
         config: this.config,
         logger: this.logger,
       })
+
+      this.disposeApproval = this.host.onApproval((request) => this.#requestApproval(request))
 
       this.status = 'running'
       this.logger.info('gateway started', {
@@ -257,6 +263,9 @@ export class Gateway {
       this.#notifyLifecycle('notifyStart')
       this.pollPromise = this.#pollLoop()
     } catch (error) {
+      this.disposeApproval?.()
+      this.disposeApproval = undefined
+      this.collector?.dispose()
       await this.lock?.release().catch(() => {})
       this.lock = undefined
       if (signal.aborted) return
@@ -286,6 +295,8 @@ export class Gateway {
     this.#clearLockRetry()
     const wasRunning = this.status === 'running' || this.status === 'paused'
     this.status = 'stopping'
+    this.disposeApproval?.()
+    this.disposeApproval = undefined
     this.abort?.abort()
     for (const active of this.active.values()) {
       active.controller.abort()
@@ -383,6 +394,10 @@ export class Gateway {
       `queue: ${queued}`,
       `paired senders: ${this.allowed?.size ?? 0}`,
     ]
+    const approvals = [...this.approvals.values()].filter((entry) => entry.userId === userId)
+    for (const entry of approvals) {
+      lines.push(`permission: /allow ${entry.id} or /deny ${entry.id}`)
+    }
     if (this.lastPollAt > 0) {
       lines.push(`last poll: ${new Date(this.lastPollAt).toISOString()}`)
     }
@@ -399,6 +414,8 @@ export class Gateway {
     const active = this.active.get(userId)
     this.queues.delete(userId)
     if (active === undefined) return 'Nothing is running.'
+    active.approvalsClosed = true
+    this.#clearApprovals(userId, active)
     this.suppressAbort.add(userId)
     try {
       if (active.phase !== 'preparing') this.host.cancel({ sessionId: active.sessionId })
@@ -427,7 +444,116 @@ export class Gateway {
    */
   async newSession(userId) {
     const created = await this.router.reset(userId)
+    this.#clearApprovals(userId)
     return `Started a new DSH session: ${created.sessionId}\nThe previous session and its history are kept.`
+  }
+
+  /**
+   * Claim a live approval only for our admitted turn. Returning undefined lets
+   * other Host answerers handle desktop or unrelated Sessions.
+   *
+   * @param {object} request - normalized approval/request from the Host.
+   * @returns {Promise<string>|string|undefined} one-shot outcome, or delegation.
+   */
+  #requestApproval(request) {
+    const owner = [...this.active.entries()].find(([, active]) => active.sessionId === request.sessionId)
+    if (owner === undefined) return undefined
+    const [userId, active] = owner
+    if (!this.collector.isActiveTurn(active)) return undefined
+    if (!this.#canApprove(userId, active)) return 'unavailable'
+    if (typeof request.toolName !== 'string' || request.toolName.trim().length === 0) return 'unavailable'
+    return this.#presentApproval(userId, active, request)
+  }
+
+  async #presentApproval(userId, active, request) {
+    const delivery = new AbortController()
+    const signal = AbortSignal.any([
+      this.abort.signal, active.controller.signal, delivery.signal,
+      ...(request.signal ? [request.signal] : []),
+    ])
+    if (signal.aborted) return 'cancelled'
+
+    let id
+    try {
+      id = await raceAbort(this.state.nextApprovalId(userId), signal)
+    } catch {
+      if (signal.aborted) return 'cancelled'
+      this.logger.error('could not persist a permission request counter')
+      return 'unavailable'
+    }
+    if (signal.aborted || !this.#canApprove(userId, active)) return 'cancelled'
+    const key = `${userId}:${id}`
+    let resolve
+    const promise = new Promise((settle) => { resolve = settle })
+    const entry = { id, userId, active, signal, delivered: false }
+    const onAbort = () => entry.finish('cancelled')
+    entry.finish = (outcome) => {
+      if (this.approvals.get(key) !== entry) return false
+      this.approvals.delete(key)
+      signal.removeEventListener('abort', onAbort)
+      delivery.abort()
+      resolve(outcome)
+      return true
+    }
+    this.approvals.set(key, entry)
+    signal.addEventListener('abort', onAbort, { once: true })
+
+    // The reason is user-facing context, not tool arguments or hidden reasoning.
+    // Bound it to keep permission prompts short; never send it to the logger.
+    const reason = request.displayReason?.en ?? request.reason
+    const text = [
+      'Permission required:',
+      `Tool: ${shorten(request.toolName, 100)}`,
+      ...(typeof reason === 'string' && reason.trim() ? [`Reason: ${shorten(reason, 600)}`] : []),
+      '',
+      `/allow ${id} — allow this action once`,
+      `/deny ${id} — reject this action`,
+      'No reply grants no permission. /stop cancels the turn.',
+    ].join('\n')
+    // Do not block the inbound message queue while waiting for a decision.
+    this.#sendText(userId, text, { signal }).then((sent) => {
+      if (sent) entry.delivered = true
+      else entry.finish('unavailable')
+    }, () => entry.finish('unavailable'))
+    return promise
+  }
+
+  /** @returns {boolean} whether the chat still owns a live, answerable turn. */
+  #canApprove(userId, active) {
+    return (this.status === 'running' || this.status === 'paused') &&
+      !this.abort.signal.aborted && !active.controller.signal.aborted && active.approvalsClosed !== true &&
+      this.allowed.isAllowed(userId) && this.active.get(userId) === active &&
+      this.state.sessionFor(userId)?.sessionId === active.sessionId &&
+      this.collector.isActiveTurn(active)
+  }
+
+  /**
+   * Consume an explicit, sender-bound decision outside the normal prompt queue.
+   *
+   * @param {string} userId - paired WeChat sender.
+   * @param {{id: string, outcome: string}} response - one request's answer.
+   * @returns {string} acknowledgement (not a claim that the tool succeeded).
+   */
+  respondApproval(userId, { id, outcome }) {
+    const entry = this.approvals.get(`${userId}:${id}`)
+    if (entry === undefined || entry.userId !== userId) return 'That permission request is no longer pending for this chat.'
+    if (entry.signal.aborted || !this.#canApprove(userId, entry.active)) {
+      entry.finish('cancelled')
+      return 'That permission request is no longer pending for this chat.'
+    }
+    if (outcome !== 'allowed-once' && outcome !== 'rejected') return 'Invalid permission response.'
+    if (outcome === 'allowed-once' && !entry.delivered) {
+      return `The permission prompt is still being delivered. Retry /allow ${id} after it arrives.`
+    }
+    entry.finish(outcome)
+    return outcome === 'allowed-once' ? 'Approval sent (allow once).' : 'Permission denied.'
+  }
+
+  /** Withdraw requests when their turn or chat mapping is no longer usable. */
+  #clearApprovals(userId, active) {
+    for (const entry of this.approvals.values()) {
+      if (entry.userId === userId && (active === undefined || entry.active === active)) entry.finish('cancelled')
+    }
   }
 
   /**
@@ -707,6 +833,7 @@ export class Gateway {
       turn?.cancel('prompt-failed')
       await this.#handleTurnError(userId, error)
     } finally {
+      this.#clearApprovals(userId, active)
       if (signal.aborted && this.status === 'error' && active.phase === 'running' && !active.cancelDuringAdmission) {
         try {
           this.host.cancel({ sessionId: active.sessionId })
@@ -928,24 +1055,28 @@ export class Gateway {
    *
    * @param {string} userId - recipient.
    * @param {string} text - reply text.
-   * @returns {Promise<void>} resolves when the chunks were sent or sending gave up.
+   * @param {object} [options] - delivery lifetime.
+   * @param {AbortSignal} [options.signal] - withdraw an obsolete permission prompt.
+   * @returns {Promise<boolean>} true only when every chunk was accepted.
    */
-  async #sendText(userId, text) {
-    if (typeof text !== 'string' || text.length === 0) return
+  async #sendText(userId, text, { signal = this.abort?.signal } = {}) {
+    if (typeof text !== 'string' || text.length === 0) return false
     const chunks = splitText(text, this.config.maxMessageChars)
-    if (chunks.length === 0) return
+    if (chunks.length === 0) return false
 
     for (let index = 0; index < chunks.length; index += 1) {
-      const sent = await this.#sendChunk(userId, chunks[index])
-      if (!sent) return
+      if (signal?.aborted) return false
+      const sent = await this.#sendChunk(userId, chunks[index], signal)
+      if (!sent) return false
       if (index < chunks.length - 1) {
         try {
-          await sleep(this.config.chunkDelayMs, this.abort?.signal)
+          await sleep(this.config.chunkDelayMs, signal)
         } catch {
-          return
+          return false
         }
       }
     }
+    return true
   }
 
   /**
@@ -953,9 +1084,10 @@ export class Gateway {
    *
    * @param {string} userId - recipient.
    * @param {string} chunk - text chunk.
+   * @param {AbortSignal} [signal] - delivery lifetime.
    * @returns {Promise<boolean>} true when the server accepted it.
    */
-  async #sendChunk(userId, chunk) {
+  async #sendChunk(userId, chunk, signal = this.abort?.signal) {
     // Keep the server's deduplication hint stable if the acknowledgement is lost.
     const clientId = randomUUID()
     const send = () =>
@@ -964,7 +1096,7 @@ export class Gateway {
         text: chunk,
         contextToken: this.state.contextTokenFor(userId),
         clientId,
-        signal: this.abort?.signal,
+        signal,
       })
 
     try {

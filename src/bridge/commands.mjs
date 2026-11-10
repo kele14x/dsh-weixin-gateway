@@ -56,6 +56,8 @@ export const HELP_TEXT = [
   '/status — account, session, and queue status',
   '/version — plugin version',
   '/bind <code> — pair this chat (first use only)',
+  '/allow <id> — allow one pending permission request once',
+  '/deny <id> — reject one pending permission request',
   '',
   'Anything else is sent to the agent as a prompt.',
 ].join('\n')
@@ -69,6 +71,7 @@ export class CommandRouter {
    * @param {(userId: string) => Promise<string>|string} options.actions.stop - `/stop` text.
    * @param {(userId: string) => Promise<string>|string} options.actions.newSession - `/new` text.
    * @param {() => string} options.actions.version - `/version` text.
+   * @param {(userId: string, response: object) => string} options.actions.approval - permission response.
    * @param {import('../store/allowed.mjs').AllowList} options.allowed - allowlist.
    * @param {object} options.config - resolved plugin config.
    * @param {object} [options.logger] - logger.
@@ -115,6 +118,19 @@ export class CommandRouter {
         return { handled: true, reply: await this.actions.newSession(userId) }
       case 'stop':
         return { handled: true, reply: await this.actions.stop(userId) }
+      case 'allow':
+      case 'deny': {
+        if (command.args.length !== 1 || !/^[1-9][0-9]*$/.test(command.args[0]) || !Number.isSafeInteger(Number(command.args[0]))) {
+          return { handled: true, reply: `Usage: /${command.name} <id> (copy the id from the permission prompt)` }
+        }
+        return {
+          handled: true,
+          reply: await this.actions.approval(userId, {
+            id: command.args[0],
+            outcome: command.name === 'allow' ? 'allowed-once' : 'rejected',
+          }),
+        }
+      }
       default:
         // Unknown slash commands are ordinary text and go to the agent.
         return { handled: false }

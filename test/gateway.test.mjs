@@ -122,6 +122,37 @@ function imageMessage({ id = 1, from = 'u1', text = '', images = 1, context = 'c
   }
 }
 
+/** Open a manually driven, correlated turn for permission-flow tests. */
+async function openGatewayTurn(t, options = {}) {
+  const fixture = await setup(t, {
+    ...options,
+    config: { turnTimeoutMs: 3000, ...options.config },
+    hostOptions: { autoRespond: false },
+    msgs: [textMessage()],
+  })
+  await fixture.gateway.start()
+  await waitFor(() => fixture.host.callsOf('prompt').length === 1)
+  fixture.prompt = fixture.host.callsOf('prompt')[0]
+  fixture.host.emit(fixture.prompt.sessionId, { type: 'turn/start', data: { turn: 1 } })
+  fixture.host.emit(fixture.prompt.sessionId, {
+    type: 'user/message', data: { source: { kind: 'user', rpcId: fixture.prompt.requestId } },
+  })
+  return fixture
+}
+
+/** Ask through the live seam and read the exact command id delivered to WeChat. */
+async function askPermission(fixture, request = {}) {
+  const { host, client, prompt } = fixture
+  const before = client.sent.length
+  const answer = host.requestApproval({
+    sessionId: prompt.sessionId, toolName: 'shell', reason: 'Run outside the sandbox', ...request,
+  })
+  await waitFor(() => client.sent.slice(before).some((message) => message.text.startsWith('Permission required:')))
+  const text = client.sent.slice(before).find((message) => message.text.startsWith('Permission required:')).text
+  const id = text.match(/\/allow ([1-9][0-9]*)/)[1]
+  return { id, answer, text }
+}
+
 test('a paired text message creates one session and replies with the assistant text', async (t) => {
   const { dir, client, host, gateway } = await setup(t, { msgs: [textMessage()] })
   await gateway.start()
@@ -877,4 +908,399 @@ test('a code issued while the gateway runs pairs a sender without a restart', as
   client.push({ msgs: [textMessage({ id: 2, from: 'u2', text: `/bind ${code}` })] })
   await waitFor(() => client.sent.length === 2, { message: 'bind reply' })
   assert.match(client.sent[1].text, /^Paired\./)
+})
+
+for (const [command, outcome] of [['allow', 'allowed-once'], ['deny', 'rejected']]) {
+  test(`/${command} answers the pending request without enqueueing a prompt`, async (t) => {
+    const fixture = await openGatewayTurn(t)
+    const { host, client, gateway, prompt } = fixture
+    const { id, answer, text } = await askPermission(fixture)
+    assert.match(text, /Tool: shell/)
+    assert.match(text, /Reason: Run outside the sandbox/)
+    assert.ok(text.includes(`/deny ${id}`))
+    assert.equal(client.sent[0].toUserId, 'u1')
+    assert.equal(client.sent[0].contextToken, 'ctx-1')
+    assert.ok(gateway.statusText('u1').includes(`/allow ${id}`))
+
+    client.push({ msgs: [textMessage({ id: 2, text: `/${command} ${id}` })] })
+    assert.equal(await answer, outcome)
+    await waitFor(() => client.sent.length === 2)
+    assert.equal(host.callsOf('prompt').length, 1)
+    assert.equal(gateway.approvals.size, 0)
+    assert.match(client.sent[1].text, command === 'allow' ? /allow once/ : /denied/)
+
+    host.emit(prompt.sessionId, {
+      type: 'assistant/message', data: { turn: 1, message: { content: [{ type: 'text', text: 'Finished.' }] } },
+    })
+    host.emit(prompt.sessionId, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } })
+    await waitFor(() => client.sent.some((message) => message.text === 'Finished.'))
+
+    client.push({ msgs: [textMessage({ id: 3, text: `/allow ${id}` })] })
+    await waitFor(() => client.sent.some((message) => /no longer pending/.test(message.text)))
+    assert.equal(host.callsOf('prompt').length, 1, 'a stale approval command must not become a new prompt')
+  })
+}
+
+test('ordinary yes/allow text cannot answer a request or bypass the turn queue', async (t) => {
+  const fixture = await openGatewayTurn(t)
+  const { client, gateway, host } = fixture
+  const { id, answer } = await askPermission(fixture)
+  client.push({ msgs: [textMessage({ id: 2, text: 'yes, allow it' })] })
+  await waitFor(() => gateway.queues.get('u1')?.length === 1)
+  assert.equal(gateway.approvals.size, 1)
+  assert.equal(host.callsOf('prompt').length, 1)
+  client.push({ msgs: [textMessage({ id: 3, text: `/deny ${id}` })] })
+  assert.equal(await answer, 'rejected')
+})
+
+test('another paired sender and an unpaired sender cannot answer or inspect the request', async (t) => {
+  const fixture = await openGatewayTurn(t)
+  const { client, gateway, host } = fixture
+  await gateway.allowed.allow('u2')
+  const { id, answer } = await askPermission(fixture)
+  assert.equal(gateway.statusText('u2').includes(`/allow ${id}`), false)
+  client.push({ msgs: [
+    textMessage({ id: 2, from: 'u2', text: `/allow ${id}` }),
+    textMessage({ id: 3, from: 'u3', text: `/allow ${id}` }),
+  ] })
+  await waitFor(() => client.sent.length === 3)
+  assert.match(client.sent[1].text, /no longer pending/)
+  assert.match(client.sent[2].text, /not paired/)
+  assert.equal(gateway.approvals.size, 1)
+  assert.equal(host.callsOf('prompt').length, 1)
+  client.push({ msgs: [textMessage({ id: 4, text: `/deny ${id}` })] })
+  assert.equal(await answer, 'rejected')
+})
+
+test('conflicting replies consume a permission request exactly once', async (t) => {
+  const fixture = await openGatewayTurn(t)
+  const { id, answer } = await askPermission(fixture)
+  fixture.client.push({ msgs: [
+    textMessage({ id: 2, text: `/deny ${id}` }),
+    textMessage({ id: 3, text: `/allow ${id}` }),
+  ] })
+  assert.equal(await answer, 'rejected')
+  await waitFor(() => fixture.client.sent.length === 3)
+  assert.match(fixture.client.sent[2].text, /no longer pending/)
+  assert.equal(fixture.host.callsOf('prompt').length, 1)
+})
+
+test('multiple permission requests have independent ids and decisions', async (t) => {
+  const fixture = await openGatewayTurn(t)
+  const first = await askPermission(fixture, { toolName: 'shell' })
+  const second = await askPermission(fixture, { toolName: 'edit' })
+  assert.equal(first.id, '1')
+  assert.equal(second.id, '2')
+  const persisted = JSON.parse(await readFile(fixture.gateway.state.file, 'utf8'))
+  assert.equal(persisted.approvalCounters.u1, 2)
+  fixture.client.push({ msgs: [
+    textMessage({ id: 2, text: `/allow ${second.id}` }),
+    textMessage({ id: 3, text: `/deny ${first.id}` }),
+  ] })
+  assert.equal(await second.answer, 'allowed-once')
+  assert.equal(await first.answer, 'rejected')
+  assert.equal(fixture.gateway.approvals.size, 0)
+})
+
+test('simultaneous approval requests in one chat receive distinct persisted numbers', async (t) => {
+  const { host, client, gateway, prompt } = await openGatewayTurn(t)
+  const first = host.requestApproval({ sessionId: prompt.sessionId, toolName: 'shell' })
+  const second = host.requestApproval({ sessionId: prompt.sessionId, toolName: 'edit' })
+  await waitFor(() => client.sent.length === 2)
+  assert.ok(client.sent[0].text.includes('/allow 1'))
+  assert.ok(client.sent[1].text.includes('/allow 2'))
+  const persisted = JSON.parse(await readFile(gateway.state.file, 'utf8'))
+  assert.equal(persisted.approvalCounters.u1, 2)
+  client.push({ msgs: [
+    textMessage({ id: 2, text: '/allow 1' }),
+    textMessage({ id: 3, text: '/deny 2' }),
+  ] })
+  assert.equal(await first, 'allowed-once')
+  assert.equal(await second, 'rejected')
+  assert.equal(gateway.approvals.size, 0)
+})
+
+test('audit events are not interactive approval requests', async (t) => {
+  const { host, client, prompt, gateway } = await openGatewayTurn(t)
+  host.emit(prompt.sessionId, { type: 'approval/asked', data: { id: 'audit-id', toolName: 'shell' } })
+  host.emit(prompt.sessionId, { type: 'approval/decided', data: { id: 'audit-id', outcome: 'unavailable' } })
+  assert.equal(client.sent.length, 0)
+  assert.equal(gateway.approvals.size, 0)
+})
+
+test('unrelated sessions and other turns delegate to the next Host answerer', async (t) => {
+  const { host, client, gateway, prompt } = await openGatewayTurn(t)
+  let delegated = 0
+  host.onApproval(() => { delegated += 1; return 'rejected' })
+  assert.equal(await host.requestApproval({ sessionId: 'desktop', toolName: 'shell' }), 'rejected')
+  host.emit(prompt.sessionId, { type: 'turn/start', data: { turn: 2 } })
+  assert.equal(await host.requestApproval({ sessionId: prompt.sessionId, toolName: 'shell' }), 'rejected')
+  assert.equal(delegated, 2)
+  assert.equal(client.sent.length, 0)
+  assert.equal(gateway.approvals.size, 0)
+})
+
+test('an unmatched prompt cannot claim an earlier desktop approval in the same session', async (t) => {
+  const { host, gateway, client } = await setup(t, {
+    msgs: [textMessage()], hostOptions: { autoRespond: false },
+  })
+  await gateway.start()
+  await waitFor(() => host.callsOf('prompt').length === 1)
+  const { sessionId } = host.callsOf('prompt')[0]
+  let delegated = 0
+  host.onApproval(() => { delegated += 1; return 'rejected' })
+  assert.equal(await host.requestApproval({ sessionId, toolName: 'shell' }), 'rejected')
+  assert.equal(delegated, 1)
+  assert.equal(client.sent.length, 0)
+})
+
+for (const withdrawal of ['request abort', 'stop', 'new', 'turn end', 'timeout', 'shutdown']) {
+  test(`permission requests are withdrawn on ${withdrawal}`, async (t) => {
+    const fixture = await openGatewayTurn(t, {
+      config: { turnTimeoutMs: withdrawal === 'timeout' ? 150 : 3000 },
+    })
+    const { host, gateway, client, prompt } = fixture
+    const controller = new AbortController()
+    const { id, answer } = await askPermission(fixture, { signal: controller.signal })
+    if (withdrawal === 'request abort') controller.abort()
+    if (withdrawal === 'stop' || withdrawal === 'new') {
+      client.push({ msgs: [textMessage({ id: 2, text: `/${withdrawal}` })] })
+    }
+    if (withdrawal === 'turn end') {
+      host.emit(prompt.sessionId, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } })
+    }
+    if (withdrawal === 'shutdown') await gateway.stop()
+    assert.equal(await answer, 'cancelled')
+    assert.equal(gateway.approvals.size, 0)
+    assert.match(gateway.respondApproval('u1', { id, outcome: 'allowed-once' }), /no longer pending/)
+    if (withdrawal === 'shutdown') assert.equal(host.approvalListeners.size, 0)
+  })
+}
+
+test('a failed timeout cancellation still withdraws the pending permission', async (t) => {
+  const fixture = await openGatewayTurn(t, { config: { turnTimeoutMs: 150 } })
+  const { id, answer } = await askPermission(fixture)
+  fixture.host.cancel = () => { throw new Error('cancel unavailable') }
+  assert.equal(await answer, 'cancelled')
+  await waitFor(() => fixture.client.sent.some((message) => /Cancellation failed/.test(message.text)))
+  assert.equal(fixture.gateway.active.get('u1').keepActive, true)
+  assert.match(fixture.gateway.respondApproval('u1', { id, outcome: 'allowed-once' }), /no longer pending/)
+})
+
+test('a new session cannot reactivate requests from the old active turn', async (t) => {
+  const fixture = await openGatewayTurn(t)
+  const { id, answer } = await askPermission(fixture)
+  await fixture.gateway.newSession('u1')
+  assert.equal(await answer, 'cancelled')
+  assert.match(fixture.gateway.respondApproval('u1', { id, outcome: 'allowed-once' }), /no longer pending/)
+  assert.equal(await fixture.host.requestApproval({ sessionId: fixture.prompt.sessionId, toolName: 'shell' }), 'unavailable')
+  assert.equal(fixture.gateway.approvals.size, 0)
+})
+
+test('a revoked sender cannot approve a pending request', async (t) => {
+  const fixture = await openGatewayTurn(t)
+  const { id, answer } = await askPermission(fixture)
+  fixture.gateway.allowed.users.delete('u1')
+  assert.match(fixture.gateway.respondApproval('u1', { id, outcome: 'allowed-once' }), /no longer pending/)
+  assert.equal(await answer, 'cancelled')
+})
+
+test('a permission cannot be granted from /status before delivery finishes or fails', async (t) => {
+  const { host, client, gateway, prompt } = await openGatewayTurn(t)
+  let rejectSend
+  client.sendMessage = () => new Promise((_, reject) => { rejectSend = reject })
+  const answer = host.requestApproval({ sessionId: prompt.sessionId, toolName: 'shell' })
+  await waitFor(() => gateway.approvals.size === 1)
+  const id = gateway.statusText('u1').match(/\/allow ([1-9][0-9]*)/)[1]
+  assert.match(gateway.respondApproval('u1', { id, outcome: 'allowed-once' }), /still being delivered/)
+  assert.equal(gateway.approvals.size, 1)
+  rejectSend(Object.assign(new Error('delivery rejected'), { code: 'http' }))
+  assert.equal(await answer, 'unavailable')
+  assert.match(gateway.respondApproval('u1', { id, outcome: 'allowed-once' }), /no longer pending/)
+})
+
+test('a failed /stop still withdraws permissions and prevents new approval requests for that turn', async (t) => {
+  const fixture = await openGatewayTurn(t)
+  const { id, answer } = await askPermission(fixture)
+  fixture.host.cancel = () => { throw new Error('cancel unavailable') }
+  fixture.client.push({ msgs: [textMessage({ id: 2, text: '/stop' })] })
+  assert.equal(await answer, 'cancelled')
+  await waitFor(() => fixture.client.sent.some((message) => /Could not cancel/.test(message.text)))
+  assert.match(fixture.gateway.respondApproval('u1', { id, outcome: 'allowed-once' }), /no longer pending/)
+  assert.equal(await fixture.host.requestApproval({ sessionId: fixture.prompt.sessionId, toolName: 'shell' }), 'unavailable')
+})
+
+test('withdrawing a permission stops delivery of its remaining chunks', async (t) => {
+  const { host, client, gateway, prompt } = await openGatewayTurn(t, {
+    config: { maxMessageChars: 40, chunkDelayMs: 100 },
+  })
+  const controller = new AbortController()
+  const answer = host.requestApproval({ sessionId: prompt.sessionId, toolName: 'shell', signal: controller.signal })
+  await waitFor(() => client.sent.length === 1)
+  controller.abort()
+  assert.equal(await answer, 'cancelled')
+  await delay(120)
+  assert.equal(client.sent.length, 1)
+  assert.equal(gateway.approvals.size, 0)
+})
+
+test('permission reasons and extra request fields do not reach default logs', async (t) => {
+  const logs = []
+  const logger = createLogger({ level: 'debug', sink: { log: (line) => logs.push(line), error: (line) => logs.push(line) } })
+  const fixture = await openGatewayTurn(t, { gatewayOptions: { logger } })
+  const { id, answer } = await askPermission(fixture, { reason: 'private-permission-reason' })
+  fixture.client.push({ msgs: [textMessage({ id: 2, text: `/deny ${id}` })] })
+  assert.equal(await answer, 'rejected')
+  assert.equal(logs.join('').includes('private-permission-reason'), false)
+})
+
+test('failed permission delivery fails closed without waiting for the turn timeout', async (t) => {
+  const { host, client, gateway, prompt } = await openGatewayTurn(t)
+  client.failNextSends = 2
+  assert.equal(await host.requestApproval({ sessionId: prompt.sessionId, toolName: 'shell' }), 'unavailable')
+  assert.equal(client.sent.length, 0)
+  assert.equal(gateway.approvals.size, 0)
+})
+
+test('already aborted and malformed requests fail closed without presenting a prompt', async (t) => {
+  const { host, client, gateway, prompt } = await openGatewayTurn(t)
+  const controller = new AbortController()
+  controller.abort()
+  assert.equal(await host.requestApproval({ sessionId: prompt.sessionId, toolName: 'shell', signal: controller.signal }), 'cancelled')
+  assert.equal(await host.requestApproval({ sessionId: prompt.sessionId, toolName: '' }), 'unavailable')
+  assert.equal(client.sent.length, 0)
+  assert.equal(gateway.approvals.size, 0)
+})
+
+test('the approval counter is durable before any prompt is sent', async (t) => {
+  const fixture = await openGatewayTurn(t)
+  const send = fixture.client.sendMessage.bind(fixture.client)
+  fixture.client.sendMessage = async (message) => {
+    const id = message.text.match(/\/allow ([1-9][0-9]*)/)[1]
+    const persisted = JSON.parse(await readFile(fixture.gateway.state.file, 'utf8'))
+    assert.ok(persisted.approvalCounters.u1 >= Number(id))
+    return send(message)
+  }
+  const { id, answer } = await askPermission(fixture)
+  assert.equal(id, '1')
+  assert.equal(fixture.gateway.respondApproval('u1', { id, outcome: 'rejected' }), 'Permission denied.')
+  assert.equal(await answer, 'rejected')
+})
+
+for (const change of ['new', 'restart']) {
+  test(`approval numbers survive ${change} and delayed decisions cannot approve a new request`, async (t) => {
+    const fixture = await openGatewayTurn(t)
+    const first = await askPermission(fixture)
+    assert.equal(first.id, '1')
+    const { gateway, host, client } = fixture
+    if (change === 'new') {
+      await gateway.newSession('u1')
+      host.emit(fixture.prompt.sessionId, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } })
+      assert.equal(await gateway.waitForQuiet(), true)
+    } else {
+      await gateway.stop()
+      await gateway.start()
+    }
+    assert.equal(await first.answer, 'cancelled')
+    client.push({ msgs: [textMessage({ id: 2, text: 'another task' })] })
+    await waitFor(() => host.callsOf('prompt').length === 2)
+    fixture.prompt = host.callsOf('prompt')[1]
+    host.emit(fixture.prompt.sessionId, { type: 'turn/start', data: { turn: 2 } })
+    host.emit(fixture.prompt.sessionId, {
+      type: 'user/message', data: { source: { kind: 'user', rpcId: fixture.prompt.requestId } },
+    })
+    const second = await askPermission(fixture)
+    assert.equal(second.id, '2')
+    client.push({ msgs: [textMessage({ id: 3, text: '/allow 1' })] })
+    await waitFor(() => client.sent.some((message) => /no longer pending/.test(message.text)))
+    assert.equal(gateway.approvals.size, 1)
+    client.push({ msgs: [textMessage({ id: 4, text: '/deny 2' })] })
+    assert.equal(await second.answer, 'rejected')
+    assert.equal(host.callsOf('prompt').length, 2)
+  })
+}
+
+test('different chats can have pending request 1 without overwriting each other', async (t) => {
+  const fixture = await openGatewayTurn(t)
+  const { host, client, gateway } = fixture
+  await gateway.allowed.allow('u2')
+  const first = await askPermission(fixture)
+  client.push({ msgs: [textMessage({ id: 2, from: 'u2', text: 'another chat task' })] })
+  await waitFor(() => host.callsOf('prompt').length === 2)
+  const prompt = host.callsOf('prompt')[1]
+  host.emit(prompt.sessionId, { type: 'turn/start', data: { turn: 1 } })
+  host.emit(prompt.sessionId, { type: 'user/message', data: { source: { rpcId: prompt.requestId } } })
+  const answer = host.requestApproval({ sessionId: prompt.sessionId, toolName: 'edit' })
+  await waitFor(() => client.sent.some((message) => message.toUserId === 'u2' && /\/allow 1\b/.test(message.text)))
+  assert.equal(first.id, '1')
+  assert.equal(gateway.approvals.size, 2)
+  client.push({ msgs: [textMessage({ id: 3, from: 'u2', text: '/deny 1' })] })
+  assert.equal(await answer, 'rejected')
+  assert.equal(gateway.approvals.size, 1)
+  client.push({ msgs: [textMessage({ id: 4, text: '/allow 1' })] })
+  assert.equal(await first.answer, 'allowed-once')
+  assert.equal(gateway.approvals.size, 0)
+})
+
+test('failed counter persistence presents nothing and retries use a new number', async (t) => {
+  const fixture = await openGatewayTurn(t)
+  const { host, client, gateway, prompt } = fixture
+  const flush = gateway.state.flush.bind(gateway.state)
+  gateway.state.flush = async () => { throw new Error('private persistence failure') }
+  assert.equal(await host.requestApproval({ sessionId: prompt.sessionId, toolName: 'shell' }), 'unavailable')
+  assert.equal(client.sent.length, 0)
+  assert.equal(gateway.approvals.size, 0)
+  gateway.state.flush = flush
+  const { id, answer } = await askPermission(fixture)
+  assert.equal(id, '2')
+  assert.match(gateway.respondApproval('u1', { id: '1', outcome: 'allowed-once' }), /no longer pending/)
+  gateway.respondApproval('u1', { id, outcome: 'rejected' })
+  assert.equal(await answer, 'rejected')
+})
+
+for (const change of ['request abort', 'stop', 'new', 'shutdown']) {
+  test(`cancellation during counter persistence (${change}) cannot present an obsolete request`, async (t) => {
+    const fixture = await openGatewayTurn(t)
+    const { gateway, host, client, prompt } = fixture
+    const nextId = gateway.state.nextApprovalId.bind(gateway.state)
+    let release
+    const held = new Promise((resolve) => { release = resolve })
+    let allocated = false
+    gateway.state.nextApprovalId = async (userId) => {
+      const id = await nextId(userId)
+      allocated = true
+      await held
+      return id
+    }
+    const controller = new AbortController()
+    const answer = host.requestApproval({ sessionId: prompt.sessionId, toolName: 'shell', signal: controller.signal })
+    await waitFor(() => allocated)
+    assert.equal(gateway.approvals.size, 0)
+    assert.equal(client.sent.length, 0)
+    if (change === 'request abort') controller.abort()
+    if (change === 'stop') gateway.stopTurn('u1')
+    if (change === 'new') await gateway.newSession('u1')
+    if (change === 'shutdown') await gateway.stop()
+    release()
+    assert.equal(await answer, 'cancelled')
+    assert.equal(client.sent.some((message) => message.text.startsWith('Permission required:')), false)
+    const persisted = JSON.parse(await readFile(gateway.state.file, 'utf8'))
+    assert.equal(persisted.approvalCounters.u1, 1)
+  })
+}
+
+test('permission context is bounded, localized, and excludes extra tool arguments', async (t) => {
+  const fixture = await openGatewayTurn(t)
+  const { id, answer, text } = await askPermission(fixture, {
+    toolName: 'x'.repeat(1000), reason: 'private raw reason',
+    displayReason: { en: 'r'.repeat(2000) },
+    arguments: { secret: 'must-not-forward' },
+  })
+  assert.ok(text.length < 1000)
+  assert.ok(text.includes(`/allow ${id}`))
+  assert.equal(text.includes('must-not-forward'), false)
+  assert.equal(text.includes('private raw reason'), false)
+  assert.equal(text.includes('r'.repeat(601)), false)
+  fixture.gateway.stopTurn('u1')
+  assert.equal(await answer, 'cancelled')
 })

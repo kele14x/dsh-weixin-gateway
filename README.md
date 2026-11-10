@@ -16,6 +16,7 @@ installation, deployment, and process supervision are managed by the operator.
 - Long replies arrive as several readable messages instead of being cut off.
 - A typing indicator shows while the agent is working on your message.
 - Send a photo or screenshot and the agent receives it as an image.
+- Permission requests arrive in chat; explicitly allow an action once or deny it.
 
 ## Requirements
 
@@ -75,8 +76,25 @@ until a successful login establishes the selection.
 | `/status` | account, session, turn, cwd, queue |
 | `/version` | plugin version |
 | `/bind <code>` | pair this chat |
+| `/allow <id>` | allow the specified pending permission request once |
+| `/deny <id>` | reject the specified pending permission request |
 
 Anything else is sent to the agent as a prompt.
+
+When an action requires permission, the bot sends the tool name, an explanation
+when supplied, and commands containing a short request number, for example
+`/allow 7` or `/deny 7`. Each chat starts at 1 and keeps increasing across `/new`
+and Host restarts. The counter is saved in the gateway's per-account state,
+separately from agent session history; deleting that state loses this protection.
+Copy the numbered command from the prompt. Only the paired chat that owns the
+running turn can answer; plain "yes" or "no" messages do not grant or deny permission.
+There is no "always allow" option, and the Host's permission policy still applies.
+
+Approval requires successful delivery of the complete prompt. Failed delivery
+grants nothing. Requests expire when withdrawn, when the turn ends or times out,
+or on `/stop`, `/new`, or gateway shutdown. Restarting never replays an approval.
+Use `/status` to see pending request IDs. The existing `turnTimeoutMs` budget
+(default 10 minutes) includes time spent waiting for your decision.
 
 ## Configuration
 
@@ -113,12 +131,12 @@ single-poller lock, retry/backoff, and `-14` handling — are in `AGENTS.md`.
 npm test
 ```
 
-Offline tests using fake iLink/Host interfaces and disposable fixtures — no
+324 offline tests using fake iLink/Host interfaces and disposable fixtures — no
 WeChat account is used.
 
 ## Limitations
 
-Text and image direct messages. Files, voice, video, group chats, approvals,
+Text and image direct messages. Files, voice, video, group chats,
 streaming, and the headless `AgentHost` fallback are not implemented. Inbound
 images are supported; sending media from the agent is not.
 `maxMessageChars: 1800` is a safety budget, not a documented server limit.

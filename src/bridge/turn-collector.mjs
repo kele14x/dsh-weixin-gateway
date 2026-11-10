@@ -78,6 +78,20 @@ export class TurnCollector {
   }
 
   /**
+   * Whether this prompt owns the currently open turn. Approval routing must not
+   * claim a desktop turn merely because it uses the same Session.
+   *
+   * @param {{sessionId: string, requestId: string}} options - prompt identity.
+   * @returns {boolean} true after our user/message and before its turn/end.
+   */
+  isActiveTurn({ sessionId, requestId }) {
+    const sid = String(sessionId)
+    const entry = this.pending.get(`${sid}:${requestId}`)
+    return entry?.matched === true && !entry.settled && entry.turn !== undefined &&
+      entry.turn === this.lastTurn.get(sid)
+  }
+
+  /**
    * Stop observing and fail every in-flight prompt.
    *
    * @returns {void}

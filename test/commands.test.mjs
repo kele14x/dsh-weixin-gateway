@@ -41,6 +41,39 @@ test('parseCommand reads a leading slash command', () => {
   assert.equal(parseCommand('/UPPER').name, 'upper')
 })
 
+test('permission commands require exactly one prompt id and map to one-shot outcomes', async (t) => {
+  const calls = []
+  const { router } = await makeRouter(t, {
+    allowed: true,
+    actions: { approval: (userId, response) => { calls.push({ userId, ...response }); return 'decision sent' } },
+  })
+  const id = '7'
+  for (const [name, outcome] of [['allow', 'allowed-once'], ['deny', 'rejected']]) {
+    const response = await router.handle({ userId: 'u1', command: { name, args: [id] }, isAllowed: true })
+    assert.deepEqual(response, { handled: true, reply: 'decision sent' })
+    assert.deepEqual(calls.at(-1), { userId: 'u1', id, outcome })
+    for (const args of [[], ['all'], [id, 'always'], ['DEADBEEFDEADBEEF'], ['bad-id'], ['0'], ['01'], ['-1'], ['1.5'], ['1e2'], ['9007199254740992'], ['0123456789abcdef']]) {
+      const invalid = await router.handle({ userId: 'u1', command: { name, args }, isAllowed: true })
+      assert.equal(invalid.handled, true)
+      assert.match(invalid.reply, /Usage:/)
+    }
+  }
+  assert.equal(calls.length, 2)
+})
+
+test('unpaired permission commands never invoke an approval action', async (t) => {
+  const { router } = await makeRouter(t, {
+    actions: { approval: () => assert.fail('unpaired approvals must be denied') },
+  })
+  for (const name of ['allow', 'deny']) {
+    const outcome = await router.handle({
+      userId: 'u1', command: { name, args: ['7'] }, isAllowed: false,
+    })
+    assert.equal(outcome.handled, true)
+    assert.match(outcome.reply, /not paired/)
+  }
+})
+
 test('safeEqual compares secrets exactly', () => {
   assert.equal(safeEqual('abc', 'abc'), true)
   assert.equal(safeEqual('abc', 'abd'), false)
@@ -171,11 +204,14 @@ test('concurrent binds consume the code once and tell the loser how to rotate it
     command: { name: 'bind', args: ['one-use-code'] },
     isAllowed: false,
   })))
-  assert.match(outcomes[0].reply, /^Paired\./)
-  assert.match(outcomes[1].reply, /already been redeemed/)
-  assert.match(outcomes[1].reply, /operator.*different code.*DSH_WEIXIN_BIND_CODE/)
-  assert.equal(allowList.isAllowed('u1'), true)
-  assert.equal(allowList.isAllowed('u2'), false)
+  // File reads can complete in either order; only one durable winner matters.
+  const winner = outcomes.findIndex((outcome) => /^Paired\./.test(outcome.reply))
+  assert.notEqual(winner, -1)
+  const loser = 1 - winner
+  assert.match(outcomes[loser].reply, /already been redeemed/)
+  assert.match(outcomes[loser].reply, /operator.*different code.*DSH_WEIXIN_BIND_CODE/)
+  assert.equal(allowList.isAllowed(['u1', 'u2'][winner]), true)
+  assert.equal(allowList.isAllowed(['u1', 'u2'][loser]), false)
 })
 
 test('bind rejects consumed codes after restart and accepts a distinct rotated code', async (t) => {

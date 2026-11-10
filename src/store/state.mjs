@@ -1,6 +1,6 @@
 /**
  * Durable channel state: the long-poll cursor, per-sender context tokens, the
- * WeChat-user to DSH-session mapping, and a bounded dedupe window.
+ * WeChat-user to DSH-session mapping, approval counters, and a bounded dedupe window.
  *
  * The file is the only place the cursor and context tokens live, so writes are
  * serialized, atomic, and mode `0600`. A corrupt file is reported instead of
@@ -56,6 +56,8 @@ export class ChannelState {
     this.contextTokens = new Map()
     this.sessions = new Map()
     /** @type {Map<string, number>} */
+    this.approvalCounters = new Map()
+    /** @type {Map<string, number>} */
     this.seen = new Map()
 
     this.#dirty = false
@@ -77,6 +79,21 @@ export class ChannelState {
     if (typeof document !== 'object' || Array.isArray(document)) {
       throw new Error(`unexpected state document shape in ${this.file}`)
     }
+    let approvalCounters = new Map()
+    if (Object.hasOwn(document, 'approvalCounters')) {
+      const counters = document.approvalCounters
+      if (
+        counters === null ||
+        typeof counters !== 'object' ||
+        Array.isArray(counters) ||
+        Object.getPrototypeOf(counters) !== Object.prototype ||
+        Object.values(counters).some((value) => !Number.isSafeInteger(value) || value < 0)
+      ) {
+        throw new Error(`unexpected approval counters in ${this.file}`)
+      }
+      approvalCounters = new Map(Object.entries(counters))
+    }
+    this.approvalCounters = approvalCounters
     this.cursor = typeof document.cursor === 'string' ? document.cursor : ''
     this.contextTokens = new Map(Object.entries(document.contextTokens ?? {}))
     this.sessions = new Map(Object.entries(document.sessions ?? {}))
@@ -107,6 +124,7 @@ export class ChannelState {
             cursor: this.cursor,
             contextTokens: Object.fromEntries(this.contextTokens),
             sessions: Object.fromEntries(this.sessions),
+            approvalCounters: Object.fromEntries(this.approvalCounters),
             dedupe: [...this.seen.entries()],
           },
           { mode: 0o600 },
@@ -160,6 +178,25 @@ export class ChannelState {
       this.#dirty = true
     }
     await this.flush()
+  }
+
+  /**
+   * Allocate a durable approval id for a sender.
+   *
+   * @param {string} userId - sender id.
+   * @returns {Promise<string>} persisted decimal id.
+   */
+  async nextApprovalId(userId) {
+    const previous = this.approvalCounters.get(userId) ?? 0
+    if (previous === Number.MAX_SAFE_INTEGER) {
+      throw new Error(`approval counter exhausted for ${userId}`)
+    }
+    // Reserve before flushing: concurrent snapshots may persist this increment even if its write fails.
+    const next = previous + 1
+    this.approvalCounters.set(userId, next)
+    this.#dirty = true
+    await this.flush()
+    return String(next)
   }
 
   /**
