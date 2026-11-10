@@ -105,6 +105,7 @@ optional: empty (the default) uses the plugin's own `workspace/` directory, and
 | `pollTimeoutMs` | iLink default | long-poll budget; the server value wins when present |
 | `queueLimit` | `8` | max queued inbound messages per sender |
 | `turnTimeoutMs` | `600000` | how long to wait for one DSH turn |
+| `typingKeepaliveMs` | `5000` | re-send the WeChat typing banner while a turn runs; `0` disables the refresh |
 | `bindCodeEnv` | `DSH_WEIXIN_BIND_CODE` | optional fixed pairing-code variable; empty disables it (`pair` codes still work) |
 | `replyMode` | `all` | send `all` steps or only the `last` |
 | `sessionPauseMs` | iLink default | pause after a `-14` response |

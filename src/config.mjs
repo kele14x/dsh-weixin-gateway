@@ -81,6 +81,12 @@ export const Config = z.object({
     .natural()
     .default(600_000)
     .description('How long to wait for one DSH turn before giving up.'),
+  typingKeepaliveMs: z
+    .natural()
+    .default(5000)
+    .description(
+      'Re-send the WeChat typing indicator at this interval while a turn runs; 0 disables the refresh.',
+    ),
   bindCodeEnv: z
     .string()
     .default('DSH_WEIXIN_BIND_CODE')

@@ -43,6 +43,12 @@ import { TurnCollector, joinSteps } from './bridge/turn-collector.mjs'
 
 /** Maximum characters of an upstream error message echoed to WeChat. */
 const MAX_ERROR_CHARS = 300
+/** Re-send the typing banner at this interval while a turn runs; WeChat expires it quickly. */
+const TYPING_KEEPALIVE_MS = 5_000
+/** A typing ticket is reusable; refresh it before the server may expire one. */
+const TYPING_TICKET_TTL_MS = 10 * 60 * 1000
+/** Bound the best-effort stop so a stalled request cannot delay the next turn. */
+const TYPING_STOP_TIMEOUT_MS = 1_500
 const LOCAL_COMMANDS = new Set(['bind', 'help', 'version', 'status', 'new', 'stop', 'allow', 'deny'])
 
 /**
@@ -138,6 +144,10 @@ export class Gateway {
     this.active = new Map()
     /** @type {Map<string, {ticket: string, at: number}>} typing tickets */
     this.typingTickets = new Map()
+    /** @type {Map<string, NodeJS.Timeout>} per-sender typing keepalive timers */
+    this.typingTimers = new Map()
+    /** @type {Set<string>} senders whose keepalive refresh is in flight */
+    this.typingRefreshing = new Set()
     /** @type {Set<string>} senders whose aborted-turn notice is suppressed */
     this.suppressAbort = new Set()
     /** @type {Map<string, number>} last unpaired-hint time per sender */
@@ -308,6 +318,7 @@ export class Gateway {
     this.disposeApproval?.()
     this.disposeApproval = undefined
     this.abort?.abort()
+    for (const userId of [...this.typingTimers.keys()]) this.#clearTypingTimer(userId)
     for (const active of this.active.values()) {
       active.controller.abort()
       if (active.phase !== 'preparing') {
@@ -900,13 +911,14 @@ export class Gateway {
     let admission
     let settled = false
     try {
+      // Start the typing indicator before session lookup so the banner also
+      // covers a cold session resume, and the ticket round trip overlaps it.
+      // `#typing` never rejects; the collector starts once content is ready.
+      const typing = this.#typing(userId, true, signal)
       const mapping = await this.router.sessionFor(userId)
       active.sessionId = mapping.sessionId
       if (signal.aborted) return
 
-      // Start the typing indicator while the image download runs. `#typing`
-      // never rejects; the collector starts once the prompt content is ready.
-      const typing = this.#typing(userId, true, signal)
       const images = await this.#loadImages(message, signal)
       if (signal.aborted) return
       if (!await this.inbound.markSubmitting(userId, message.messageId) || signal.aborted) return
@@ -969,7 +981,7 @@ export class Gateway {
       signal.removeEventListener('abort', onAbort)
       if (!active.keepActive) this.active.delete(userId)
       this.suppressAbort.delete(userId)
-      await this.#typing(userId, false, signal)
+      await this.#typing(userId, false)
     }
   }
 
@@ -1221,30 +1233,135 @@ export class Gateway {
   }
 
   /**
-   * Best-effort typing indicator.
+   * Best-effort typing indicator with a keepalive refresh.
+   *
+   * WeChat clears the banner on its own within seconds, so a long turn must
+   * keep sending `status = 1` (the protocol notes recommend roughly every five
+   * seconds). The refresh never blocks a turn, and the stop is still sent after
+   * the turn's own signal was aborted by `/stop` or a timeout; otherwise the
+   * banner would be left to expire by itself.
    *
    * @param {string} userId - target user.
    * @param {boolean} on - true to start, false to stop.
+   * @param {AbortSignal} [signal] - start lifetime; the stop uses the gateway's.
    * @returns {Promise<void>} resolves even when typing is unavailable.
    */
   async #typing(userId, on, signal = this.abort?.signal) {
+    if (!on) {
+      await this.#stopTyping(userId)
+      return
+    }
     try {
-      let cached = this.typingTickets.get(userId)
-      if (!on && cached === undefined) return
-      if (on && (cached === undefined || Date.now() - cached.at > 10 * 60 * 1000)) {
-        const config = await raceAbort(this.client.getConfig({
-          userId,
-          contextToken: this.state.contextTokenFor(userId),
-          signal,
-        }), signal)
-        if (typeof config.typingTicket !== 'string' || config.typingTicket.length === 0) return
-        cached = { ticket: config.typingTicket, at: Date.now() }
-        this.typingTickets.set(userId, cached)
+      const ticket = await this.#typingTicket(userId, signal)
+      if (ticket === undefined) return
+      await this.#sendTypingStatus(userId, ticket, TYPING_START, signal)
+      this.#scheduleTypingKeepalive(userId)
+    } catch (error) {
+      if (error.code !== 'aborted') {
+        this.logger.debug('typing indicator unavailable', { reason: error.message })
       }
+    }
+  }
+
+  /**
+   * Read the cached typing ticket, fetching a fresh one when it is missing or old.
+   *
+   * @param {string} userId - target user.
+   * @param {AbortSignal} [signal] - caller lifetime.
+   * @returns {Promise<string|undefined>} ticket, or undefined when the server sends none.
+   */
+  async #typingTicket(userId, signal) {
+    const cached = this.typingTickets.get(userId)
+    if (cached !== undefined && Date.now() - cached.at <= TYPING_TICKET_TTL_MS) return cached.ticket
+    const config = await raceAbort(this.client.getConfig({
+      userId,
+      contextToken: this.state.contextTokenFor(userId),
+      signal,
+    }), signal)
+    if (typeof config.typingTicket !== 'string' || config.typingTicket.length === 0) return undefined
+    this.typingTickets.set(userId, { ticket: config.typingTicket, at: Date.now() })
+    return config.typingTicket
+  }
+
+  /**
+   * Send one typing status and drop a rejected ticket so the next attempt refetches.
+   *
+   * @param {string} userId - target user.
+   * @param {string} ticket - typing ticket.
+   * @param {number} status - start or stop.
+   * @param {AbortSignal} [signal] - request lifetime.
+   * @returns {Promise<void>} resolves once accepted.
+   */
+  async #sendTypingStatus(userId, ticket, status, signal) {
+    try {
+      await raceAbort(this.client.sendTyping({ userId, typingTicket: ticket, status, signal }), signal)
+    } catch (error) {
+      if (status === TYPING_START) this.typingTickets.delete(userId)
+      throw error
+    }
+  }
+
+  /**
+   * Refresh the banner while the turn runs, at most one request at a time.
+   *
+   * @param {string} userId - target user.
+   * @returns {void}
+   */
+  #scheduleTypingKeepalive(userId) {
+    const intervalMs = this.config.typingKeepaliveMs ?? TYPING_KEEPALIVE_MS
+    this.#clearTypingTimer(userId)
+    if (!Number.isSafeInteger(intervalMs) || intervalMs <= 0) return
+    const timer = setInterval(() => {
+      this.#refreshTyping(userId).catch((error) => {
+        if (error.code !== 'aborted') {
+          this.logger.debug('typing indicator unavailable', { reason: error.message })
+        }
+      })
+    }, intervalMs)
+    timer.unref?.()
+    this.typingTimers.set(userId, timer)
+  }
+
+  /**
+   * Send one keepalive refresh, re-fetching the ticket after a failure.
+   *
+   * @param {string} userId - target user.
+   * @returns {Promise<void>} resolves after the attempt.
+   */
+  async #refreshTyping(userId) {
+    if (this.typingRefreshing.has(userId)) return
+    if (this.abort?.signal.aborted) {
+      this.#clearTypingTimer(userId)
+      return
+    }
+    this.typingRefreshing.add(userId)
+    try {
+      const ticket = await this.#typingTicket(userId, this.abort?.signal)
+      // A stop may have cleared the timer while the ticket was in flight.
+      if (ticket === undefined || !this.typingTimers.has(userId)) return
+      await this.#sendTypingStatus(userId, ticket, TYPING_START, this.abort?.signal)
+    } finally {
+      this.typingRefreshing.delete(userId)
+    }
+  }
+
+  /**
+   * Clear the banner and stop refreshing it.
+   *
+   * @param {string} userId - target user.
+   * @returns {Promise<void>} resolves after the best-effort stop.
+   */
+  async #stopTyping(userId) {
+    this.#clearTypingTimer(userId)
+    const cached = this.typingTickets.get(userId)
+    if (cached === undefined) return
+    if (this.abort?.signal.aborted) return
+    const signal = AbortSignal.timeout(TYPING_STOP_TIMEOUT_MS)
+    try {
       await raceAbort(this.client.sendTyping({
         userId,
         typingTicket: cached.ticket,
-        status: on ? TYPING_START : TYPING_STOP,
+        status: TYPING_STOP,
         signal,
       }), signal)
     } catch (error) {
@@ -1252,6 +1369,19 @@ export class Gateway {
         this.logger.debug('typing indicator unavailable', { reason: error.message })
       }
     }
+  }
+
+  /**
+   * Cancel a sender's keepalive timer.
+   *
+   * @param {string} userId - target user.
+   * @returns {void}
+   */
+  #clearTypingTimer(userId) {
+    const timer = this.typingTimers.get(userId)
+    if (timer === undefined) return
+    clearInterval(timer)
+    this.typingTimers.delete(userId)
   }
 
   /**

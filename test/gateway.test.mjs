@@ -766,6 +766,57 @@ for (const stage of ['getConfig', 'sendTyping']) {
   })
 }
 
+test('the typing banner is refreshed through a long turn and cleared once', async (t) => {
+  const { client, host, gateway } = await setup(t, {
+    config: { typingKeepaliveMs: 10 },
+    hostOptions: { autoRespond: false },
+  })
+  await gateway.start()
+  client.push({ msgs: [textMessage()] })
+  await waitFor(() => client.typing.filter((entry) => entry.status === 1).length >= 3, {
+    message: 'typing refresh',
+  })
+  assert.equal(client.typing.every((entry) => entry.status === 1), true)
+
+  const prompt = host.callsOf('prompt')[0]
+  host.emitTurn({ sessionId: prompt.sessionId, requestId: prompt.requestId, text: 'echo:hello' })
+  await waitFor(() => client.typing.at(-1)?.status === 2, { message: 'typing stop' })
+
+  const starts = client.typing.filter((entry) => entry.status === 1).length
+  await delay(40)
+  assert.equal(client.typing.filter((entry) => entry.status === 2).length, 1)
+  assert.equal(client.typing.filter((entry) => entry.status === 1).length, starts)
+})
+
+test('a cancelled turn still clears the typing banner', async (t) => {
+  const { client, gateway } = await setup(t, { hostOptions: { autoRespond: false } })
+  await gateway.start()
+  client.push({ msgs: [textMessage()] })
+  await waitFor(() => client.typing.some((entry) => entry.status === 1), { message: 'typing start' })
+  assert.match(await gateway.stopTurn('u1'), /Stopping/)
+  await waitFor(() => client.typing.at(-1)?.status === 2, { message: 'typing stop after cancel' })
+})
+
+test('typing starts while a cold session is still being created', async (t) => {
+  const { client, host, gateway } = await setup(t, { hostOptions: { autoRespond: false } })
+  const created = Promise.withResolvers()
+  t.after(() => created.resolve())
+  host.createSession = async ({ cwd, agentPreset }) => {
+    host.calls.push({ type: 'create', cwd, agentPreset })
+    await created.promise
+    return 'sess-cold'
+  }
+  await gateway.start()
+  client.push({ msgs: [textMessage()] })
+  await waitFor(() => client.typing.some((entry) => entry.status === 1), {
+    message: 'typing before session creation settles',
+  })
+  assert.equal(host.callsOf('prompt').length, 0)
+  created.resolve()
+  await waitFor(() => host.callsOf('prompt').length === 1, { message: 'prompt after creation' })
+  await gateway.stop()
+})
+
 for (const occupied of [false, true]) {
   test(`restart after ownership loss tears down the old generation before ${occupied ? 'lock refusal' : 'reacquisition'}`, async (t) => {
     const { config, client, host, gateway } = await setup(t)
