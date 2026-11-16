@@ -1,97 +1,73 @@
 # Known issues
 
-New findings were reviewed at `1497dc2`. Previous findings were reviewed at `a7d8f49`; the nine offline fixes were committed in `8d77e08`. Original issue numbers are retained.
-
 Priority: **P1** denotes a high-priority reliability or access-control defect; **P2** denotes a correctness or deployment defect; **P3** denotes a lower-priority correctness or diagnostic defect.
+
+Findings are numbered once and keep their number forever, so gaps are expected. Reviews: `a7d8f49` (1–10), `1497dc2` (14–22), `7d1bf8c` (23–34).
 
 ## Open issues
 
-No open findings from the recorded reviews remain. The remaining limitations below still apply.
+### P2
+
+- **24 — Nothing restarts a channel that reached `status = 'error'`**
+  Lock loss, a failed `-14` pause heartbeat, and an inbound-journal write failure all set `error` and stop polling. `Gateway.start()` already knows how to recover from `error` (it stops, then starts), but no caller invokes it: the plugin effect starts once at mount, and the retry timer only fires while `status === 'locked'`. One transient `ENOSPC` therefore disables the channel until the Host restarts. Polling has stopped, so the operator cannot even send `/status` to discover it — the only signal is a log line.
+- **25 — Inbound images have no aggregate bound**
+  Each download is capped by `maxImageBytes` and `mediaTimeoutMs`, but the message total is not. At the defaults (9 images × 20 MB) the runtime holds ~180 MB of buffers and then base64-encodes them into one prompt payload (~240 MB of strings). The time is unbounded too: downloads run sequentially before `collector.begin()`, so `turnTimeoutMs` never covers them.
+- **26 — The API origin accepts any scheme, including a server-supplied one**
+  `normalizeBaseUrl` passes `http:` and `ftp:` through unchanged and keeps URL userinfo, and `baseUrl` is a bare `z.string()` in the schema. This matters because QR login adopts a **server-supplied** `redirect_host` and `baseurl`, persists them into the account record, and every later authenticated call sends `Authorization: Bearer <botToken>` to that origin — a cleartext downgrade path for the one credential that matters. `MediaDownloader` already enforces https and rejects credentials/query/fragment for `cdnBaseUrl`; the API origin has no equivalent guard. `http://` is required for loopback tests, so gate it rather than remove it.
+
+### P3
+
+- **27 — The poll budget has no margin over the server's hold time**
+  The client adopts `longpolling_timeout_ms` as its own abort deadline, so a clean server response and a client timeout race on every poll. Harmless today because the cursor is preserved, but it makes `timedOut` the normal outcome and masks genuine timeouts. Add a few seconds of slack.
+- **28 — The lock heartbeat is coupled to poll success, not to a timer**
+  `touch()` runs only after a successful `getUpdates` and during a `-14` pause, so through a network-backoff stretch the heartbeat goes unrefreshed against the 120 s stale window. Single-host ownership is unaffected (that path uses PID plus boot identity, never the heartbeat), which means the cross-host staleness rule is only half-guaranteed.
+- **29 — `ChannelState` re-implements bot-id sanitization**
+  It inlines the character substitution instead of calling `safeBotId`, so it misses the empty/`.`/`..` guard and the 120-character cap. Both paths also map `a/b` and `a_b` onto the same filename, so two distinct bot ids can collide onto one state file, lock, and journal.
+- **30 — `logout` deletes the shared allowlist**
+  It removes `allowed.json` and any pending pairing code for the whole `stateDir`, revoking every other account's pairings, not just the one being logged out.
+- **31 — `login` takes no poller lock, and `status` misreports lock state**
+  `login` can replace the active-account selection while a gateway polls a different bot id; a following `logout` then locks the *new* id and deletes state underneath a live *old* poller. Separately, `status` prints `lock: held` from bare file existence, which is simply wrong after a crash.
+- **32 — `WorkspaceBinder.detach()` latches the registry wait**
+  `detach()` clears the binding but leaves `waitedForRegistry` and `available` set. If the `sessionController` effect re-runs after the registry effect disposed, `ensure()` skips its bounded wait and sidebar grouping is silently lost for the rest of the process lifetime.
+- **33 — One undownloadable image discards the whole message**
+  `#loadImages` throws before the journal reaches `submitting`, so the accompanying text prompt is never submitted and the user only sees the image error. Their text is gone with no hint that it was dropped.
+- **34 — Minor cleanups**
+  `scrub()`'s cycle guard shares one `seen` set down the whole tree and never pops, so a legitimately repeated (non-circular) object renders as `[circular]`. Dead code: an unused `LockError` import in `runtime.mjs`, and unreferenced exports `extractText` and `rawMessageId` in `ilink/messages.mjs`, plus `PACKAGE_NAME`, `MESSAGE_TYPE_USER`, `ITEM_TYPE_VOICE/FILE/VIDEO`, and `PATHS.uploadUrl` in `ilink/constants.mjs`.
 
 ## Fixed issues
 
-All nine fixes below are included in `8d77e08` and covered by offline regression tests.
+Findings 1–10 landed in `8d77e08`; 14–22 and 23 followed separately. All are covered by offline regression tests. Findings 4 and 11–13 and 21 do not appear: 11–13 and 21 were Host-deployment findings, retired when the Host setup examples and their example-only healthcheck tests were removed — this repository provides a DSH plugin, not Host deployment or process supervision.
 
-- **1. P1 — Concurrent poller ownership**
-  Resolution: publish initialized locks atomically, serialize stale takeover, and
-  stop polling on ownership loss.
-  Coverage: [lock](test/lock.test.mjs)
-- **2. P1 — Failed command skips batch messages**
-  Resolution: isolate message failures and checkpoint only after handling the batch.
-  Coverage: [gateway](test/gateway.test.mjs)
-- **3. P1 — Reusable pairing code**
-  Resolution: atomically persist authorization and a consumed code fingerprint;
-  failed writes grant no access.
-  Coverage: [allowlist](test/allowed.test.mjs), [commands](test/commands.test.mjs)
-- **5. P2 — Missing CLI values target the wrong account**
-  Resolution: reject missing/blank/option-like values; logout refuses a live
-  poller and releases its own lock.
-  Coverage: [CLI](test/cli.test.mjs)
-- **6. P2 — Timeout loses cancellation handle**
-  Resolution: request cancellation on timeout and retain failed-cancellation
-  handles for `/stop`; typing shares the turn deadline.
-  Coverage: [gateway](test/gateway.test.mjs)
-- **7. P2 — Stop still admits a prompt**
-  Resolution: track per-turn cancellation and wait for pending admission before
-  allowing newer prompts.
-  Coverage: [gateway](test/gateway.test.mjs)
-- **8. P2 — Initial creation overwrites `/new`**
-  Resolution: serialize creation and reset per sender, including failure recovery.
-  Coverage: [session router](test/session-router.test.mjs)
-- **9. P2 — Verification ignores timeout/abort**
-  Resolution: bound input by the remaining login deadline and abort signal,
-  including readline cancellation.
-  Coverage: [auth](test/auth.test.mjs), [CLI](test/cli.test.mjs)
-- **10. P2 — Retry restarts after shutdown**
-  Resolution: track startup/shutdown/drains and tear down the old generation
-  before restarting.
-  Coverage: [gateway](test/gateway.test.mjs)
+### P1
 
-The following fixes followed separately and are also covered by offline regression tests.
+- **1 — Concurrent poller ownership.** Publish initialized locks atomically, serialize stale takeover, and stop polling on ownership loss. [lock](test/lock.test.mjs)
+- **2 — A failed command skipped the rest of its batch.** Isolate per-message failures and checkpoint the cursor only after the whole batch is handled. [gateway](test/gateway.test.mjs)
+- **3 — Reusable pairing code.** Persist authorization and a consumed-code fingerprint atomically; a failed write grants no access. [allowlist](test/allowed.test.mjs), [commands](test/commands.test.mjs)
+- **23 — An out-of-range server poll budget wedged polling permanently.** `longpolling_timeout_ms` was adopted verbatim; Node's `AbortSignal.timeout` throws above 2^32-1 ms and silently truncates to 1 ms above 2^31-1 ms, so every later request failed before reaching the network and only a successful poll could reset it. Clamp every request timer to `MAX_TIMEOUT_MS` and cap both the adopted server value and the configured `pollTimeoutMs` at `MAX_POLL_TIMEOUT_MS`, which also keeps one silent poll under the lock's stale window. [client](test/client.test.mjs), [gateway](test/gateway.test.mjs), [plugin](test/plugin.test.mjs)
 
-- **14. P2 — Outbound retries generate a new message ID**
-  Resolution: generate one `clientId` per chunk and reuse it on the retry as a
-  server-side deduplication hint.
-  Coverage: [gateway](test/gateway.test.mjs)
-- **15. P2 — Chunking removes significant indentation**
-  Resolution: prefer newline splits over space splits and drop only the whitespace
-  at a split, so a chunk that starts a line keeps its indentation.
-  Coverage: [chunk](test/chunk.test.mjs)
-- **16. P2 — Schema-valid zero chunk size disables replies**
-  Resolution: require `maxMessageChars` to be at least 1 in the configuration schema.
-  Coverage: [plugin](test/plugin.test.mjs)
-- **17. P2 — Logout can reactivate a previously replaced account**
-  Resolution: login persists an explicit active-account selection; logout clears it
-  before deleting the active credential. Startup never falls back to older credentials.
-  Coverage: [CLI](test/cli.test.mjs), [gateway](test/gateway.test.mjs)
-- **18. P2 — Same-value retries falsely acknowledge persistence**
-  Resolution: cursor and context-token setters flush pending writes even when the
-  value is unchanged, including concurrent callers.
-  Coverage: [state](test/state.test.mjs)
-- **19. P2 — PID reuse prevents abandoned-lock recovery**
-  Resolution: persist boot identity and process start time; recover a local lock
-  when the recorded generation differs. Matching or unverifiable live owners remain
-  protected regardless of heartbeat age.
-  Coverage: [lock](test/lock.test.mjs)
-- **20. P3 — HTTP phases bypass the overall QR-login deadline**
-  Resolution: cap QR HTTP requests at the remaining overall budget and the shorter
-  client timeout; reject late responses and credentials.
-  Coverage: [auth](test/auth.test.mjs), [client](test/client.test.mjs)
-- **22. P3 — Pairing requires a manually exported environment variable**
-  Resolution: `dsh-weixin pair` issues a single-use code with a 15-minute expiry
-  and stores only its hash in `<stateDir>/pairing.json`. `/bind` rereads it on
-  every attempt, so pairing needs no environment edit or Host restart. `status`
-  reports whether a code is pending, expired, or redeemed; `logout` clears it,
-  including when no account is active.
-  The `bindCodeEnv` code remains an optional fallback.
-  Coverage: [commands](test/commands.test.mjs), [CLI](test/cli.test.mjs),
-  [gateway](test/gateway.test.mjs)
+### P2
 
-Former Host-deployment findings **11–13 and 21** are retired: Host setup examples
-and their example-only healthcheck tests have been removed. This repository
-provides a DSH plugin, not Host deployment or process supervision.
+- **5 — Missing CLI values targeted the wrong account.** Reject missing, blank, and option-like values; `logout` refuses a live poller and releases its own lock. [CLI](test/cli.test.mjs)
+- **6 — A timeout lost its cancellation handle.** Request cancellation on timeout, retain failed-cancellation handles for `/stop`, and let typing share the turn deadline. [gateway](test/gateway.test.mjs)
+- **7 — `/stop` still admitted a prompt.** Track per-turn cancellation and wait for a pending admission before admitting a newer prompt. [gateway](test/gateway.test.mjs)
+- **8 — Initial session creation overwrote `/new`.** Serialize creation and reset per sender, including failure recovery. [session router](test/session-router.test.mjs)
+- **9 — Verification ignored the timeout and abort signal.** Bound interactive input by the remaining login deadline and the abort signal, including readline cancellation. [auth](test/auth.test.mjs), [CLI](test/cli.test.mjs)
+- **10 — A retry restarted after shutdown.** Track startup/shutdown/drains and tear down the old generation before restarting. [gateway](test/gateway.test.mjs)
+- **14 — Outbound retries generated a new message id.** Mint one `clientId` per chunk and reuse it on the retry as a server-side deduplication hint. [gateway](test/gateway.test.mjs)
+- **15 — Chunking removed significant indentation.** Prefer newline splits over space splits and drop only the whitespace at the split itself. [chunk](test/chunk.test.mjs)
+- **16 — A schema-valid zero chunk size disabled replies.** Require `maxMessageChars` to be at least 1 in the configuration schema. [plugin](test/plugin.test.mjs)
+- **17 — `logout` could reactivate a previously replaced account.** Persist an explicit active-account selection and clear it before deleting the credential; startup never falls back to older credentials. [CLI](test/cli.test.mjs), [gateway](test/gateway.test.mjs)
+- **18 — Same-value retries falsely acknowledged persistence.** Cursor and context-token setters flush pending writes even when the value is unchanged, including for concurrent callers. [state](test/state.test.mjs)
+- **19 — PID reuse prevented abandoned-lock recovery.** Persist boot identity and process start time and recover a local lock when the recorded generation differs; matching or unverifiable live owners stay protected regardless of heartbeat age. [lock](test/lock.test.mjs)
+
+### P3
+
+- **20 — HTTP phases bypassed the overall QR-login deadline.** Cap QR requests at the remaining overall budget and the shorter client timeout; reject late responses and credentials. [auth](test/auth.test.mjs), [client](test/client.test.mjs)
+- **22 — Pairing required a manually exported environment variable.** `dsh-weixin pair` issues a single-use code with a 15-minute expiry and stores only its hash; `/bind` rereads it on every attempt, so pairing needs no environment edit or Host restart. `status` reports pending/expired/redeemed and `logout` clears it. The `bindCodeEnv` code remains an optional fallback. [commands](test/commands.test.mjs), [CLI](test/cli.test.mjs), [gateway](test/gateway.test.mjs)
 
 ## Remaining limitations
+
+These are design boundaries, not defects.
 
 - **Media scope:** Only inbound images are implemented. Files, voice, video, and outbound media are still unsupported; mixed messages keep their images and text and report the skipped items. The CDN media rules are derived from Tencent's client behaviour, not a stable public contract, and have not been exercised against a live WeChat account.
 - **Delivery durability:** Prompt and reply payloads remain in memory; DSH owns the conversation transcript. Accepted prompts are journaled as metadata before dedupe persistence and dispatch. The same journal tracks terminal replies before sending and records acknowledged chunk counts; after a crash or shutdown, startup warns about unfinished work and potentially incomplete replies without replaying either. A crash between server acceptance and local acknowledgement persistence can produce a conservative warning even if the reply arrived. Fully acknowledged records are cleared without warnings. Command replies, permission prompts, and pre-result error notices remain best-effort. Failed recovery notices remain pending until a later startup or inbound message. Automatic queue recovery, durable outgoing reply content, and exactly-once execution are not implemented. Atomic renames protect against process crashes, not filesystem or power loss; messages lost before journal acceptance also remain outside this guarantee.
@@ -102,19 +78,13 @@ provides a DSH plugin, not Host deployment or process supervision.
 - **Pairing rotation:** Codes consumed before the fix cannot be reconstructed. Rotate the existing code when deploying. `dsh-weixin pair` issues a fresh code without a restart; a code in the `bindCodeEnv` variable still needs a distinct value and, normally, a Host restart. Revocation does not reactivate a consumed code. Issued codes live in one file per `stateDir`, so only the latest `pair` code is valid.
 - **Sidebar grouping:** DSH groups Sessions by Workspace, and a Session belongs to exactly one, so every WeChat conversation shares one group (`workspaceTitle`); per-sender sub-groups are not expressible. A profile without `workspaceRegistry` stays ungrouped, and a `sessionController` that rejects `workspaceId` (older than the required DSH version) would fail creation. Adoption relies on the mappings recorded in `<stateDir>/state/*.json`, so a Session whose mapping was lost stays ungrouped. Removing the group while the Host runs leaves new Sessions ungrouped until the next Host start re-registers it; deleting the group again recreates it on every start unless `workspaceTitle` is emptied.
 
-## Validation and scope
+## Validation scope
 
-- After adding sidebar Workspace grouping: all 499 offline tests passed, plus `npm run check`. The native identity test now recognizes a host that cannot run the probe — for example a sandbox that denies executing setuid `/bin/ps` — and asserts the documented heartbeat fallback there instead of reporting a false failure. Coverage includes the optional `workspaceRegistry` injection against a real Cordis context (service provided after plugin mount), one-time registration, adoption from every account state file, skipping already-grouped and stale mappings, the bounded wait for a late registry, and `workspaceId` Session creation with an ungrouped fallback. No live WeChat account was used, and the running Host was not restarted to observe the group in the sidebar.
-- After adding metadata-only outbound interruption tracking: all **472 offline tests** passed, plus `npm run check`, syntax checks of changed modules, and `git diff --check`. Coverage includes real SIGKILL before sending, between chunks, after server acceptance without a saved acknowledgement, and after all acknowledgements before cleanup; payload exclusion, failed sends and persistence, cancellation, and account/sender isolation are also covered. Reply text is never persisted or replayed by the gateway. No live WeChat account or DSH Host was exercised.
-- After adding phase-1 inbound interruption tracking: all **410 offline tests** passed, plus `npm run check`, syntax checks of changed modules, and `git diff --check`. Coverage includes real SIGKILL recovery for queued and submitting work, graceful restarts, durable acceptance ordering, failed writes and notices, cancellation, account isolation, and duplicate suppression beyond the ordinary dedupe window. Recovery sends notices only; no prompts are replayed. No live WeChat account or DSH Host was exercised.
-- After adding inbound image support: all **232 offline plugin tests** passed, plus `npm run check` and `git diff --check`. Media tests cover AES key encodings, AES-128-ECB round trips, CDN URL construction, byte caps, host allowlisting, image magic-byte sniffing, lossless uint64 ids, and the gateway image prompt/failure paths. No live WeChat account, CDN, or DSH Host was exercised.
-- Fix for issue 22: all **206 offline tests** passed, plus `npm run check` and `git diff --check`. Coverage includes clearing accountless pairing codes on logout and rejecting them after a subsequent login. `pair` and `status` were also run manually against a scratch state directory. No live WeChat account or DSH Host was exercised.
-- After removing Host setup examples and their 32 example-only tests: all **200 remaining offline plugin tests** passed, plus `npm run check` and `git diff --check`. Plugin runtime code is unchanged; no live WeChat account or DSH Host was exercised.
-- Fixes for issues 19–21 in `9d6331d`: all **232 offline tests** passed, including 32 checks for the now-removed Host healthcheck example, plus `npm run check`, explicit syntax checks of the changed modules, and `git diff --check`. Native macOS identity probes were checked across processes with differing locale/timezone settings. Linux `/proc` parsing used injected fixtures; PID reuse and boot changes were simulated. Plugin coverage also includes five-contender generation takeovers, deadline-bound QR fetch/acknowledgement cancellation, and late confirmation. No native Linux kernel, live WeChat account, or DSH Host was exercised.
-- Fixes for issues 17 and 18 in `def3f4e`: all **154 offline tests** passed, plus `npm run check`, explicit syntax checks of the changed source modules, and `git diff --check`. Coverage includes forced account replacement, logout without fallback, missing/corrupt selection, failed selection writes, and failed state writes with same-value retries and concurrent callers. No live WeChat account or DSH Host was exercised.
-- Review of `1497dc2`: all **137 offline tests** passed, along with `npm run check` and `git diff --check`. A production dependency audit through the official npm registry reported zero vulnerabilities; the configured mirror did not support the audit endpoint.
-- All eight new findings were independently reproduced using injected transports or cleaned-up disposable fixtures. PID reuse was simulated, not triggered through OS PID recycling. No live WeChat account or live DSH integration was exercised; the former Host healthcheck script was run locally.
-- Before committing `8d77e08`, all **137 offline tests** passed in three consecutive runs, plus `npm run check` and `git diff --check`.
-- Each run included 100 fresh and 100 stale lock trials with five contenders, plus separate-process contention for both cases. This is regression evidence, not proof of every schedule or filesystem behavior.
-- Tests used macOS, fake Host/client interfaces, temporary files, loopback HTTP, child processes, and offline readline streams. Only disposable fixture accounts were logged out; no live WeChat account or Host deployment was tested.
-- The initial npm audit at `0f798c1` reported zero known dependency vulnerabilities; dependency manifests remain unchanged. This is not an exhaustive security assessment.
+The per-change test counts that used to accumulate here are in the git history, and the README carries the current total. What follows are the durable caveats, which apply to every fix recorded above.
+
+- Everything is offline: fake iLink and Host interfaces, temporary fixtures, loopback HTTP, child processes, and offline readline streams. The current suite is 503 tests.
+- **No live WeChat account, CDN, or DSH Host has ever been exercised.** The iLink wire format, QR states, and CDN media rules are reverse-engineered from Tencent's client behaviour, so every protocol assumption in this repository is unverified against production. This is the single largest source of residual risk and no offline test can close it.
+- Process-identity evidence is partly simulated: PID reuse and boot changes were injected rather than triggered through real OS PID recycling, Linux `/proc` parsing used fixtures, and native macOS probes were checked across differing locale/timezone settings. The identity test tolerates a sandbox that cannot execute setuid `/bin/ps` and asserts the documented heartbeat fallback there.
+- Lock contention was measured with 100 fresh and 100 stale trials at five contenders each, plus separate-process contention for both cases. That is regression evidence, not proof of every schedule or filesystem behaviour.
+- The production dependency audit reported zero known vulnerabilities at `0f798c1`; the manifests are unchanged. That is not an exhaustive security assessment.
+- Fixes are verified by reverting each layer independently and confirming it fails only its own new test, then reproducing the original defect scenario before and after. Finding 23 was validated that way.
