@@ -2,8 +2,10 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { mkdir, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
-import { Config, apply, name } from '../src/index.mjs'
+import { setTimeout as delay } from 'node:timers/promises'
+import { Config, apply, name, startWithRecovery } from '../src/index.mjs'
 import { DEFAULT_BASE_URL, DEFAULT_POLL_TIMEOUT_MS, MAX_POLL_TIMEOUT_MS } from '../src/ilink/constants.mjs'
+import { createLogger } from '../src/util/log.mjs'
 import { cleanup, makeTempDir, waitFor } from './helpers/tmp.mjs'
 
 /**
@@ -239,4 +241,143 @@ test('a fresh install groups under the default WeChat title', async (t) => {
 
   await record.disposers[0]()
   await record.workspaceDisposers[0]()
+})
+
+/**
+ * Capture plugin log lines for assertions.
+ *
+ * @returns {{logger: object, lines: string[]}} logger and every line it emitted.
+ */
+function captureLogs() {
+  const lines = []
+  const sink = { log: (line) => lines.push(line), error: (line) => lines.push(line) }
+  return { logger: createLogger({ level: 'debug', sink }), lines }
+}
+
+/**
+ * Stub gateway whose start attempts follow a scripted outcome.
+ *
+ * A failed attempt reports through `onFatal` and then rejects, exactly as
+ * `Gateway.#start` does, so the supervisor sees both signals at once.
+ *
+ * @param {(starts: number) => 'running'|'error'} outcome - status per attempt.
+ * @returns {object} stub gateway.
+ */
+function stubGateway(outcome) {
+  return {
+    status: 'stopped',
+    starts: 0,
+    onFatal: undefined,
+    async start() {
+      this.starts += 1
+      this.status = outcome(this.starts)
+      if (this.status === 'error') {
+        const error = new Error('channel failure')
+        this.onFatal?.(error)
+        throw error
+      }
+      return undefined
+    },
+  }
+}
+
+test('a channel that stopped is restarted and resumes polling', async () => {
+  const { logger, lines } = captureLogs()
+  const gateway = stubGateway(() => 'running')
+  const recovery = startWithRecovery(gateway, logger, { budgetMs: 2000, baseDelayMs: 1 })
+
+  assert.equal(gateway.starts, 1, 'the channel is started once at mount')
+  assert.equal(gateway.status, 'running')
+
+  gateway.status = 'error'
+  gateway.onFatal(new Error('poller lock ownership was lost'))
+
+  await waitFor(() => gateway.starts === 2, { message: 'the channel restarted' })
+  assert.equal(gateway.status, 'running')
+  assert.ok(lines.some((line) => line.includes('retrying')), lines.join('\n'))
+  recovery.dispose()
+})
+
+test('recovery gives up after the budget with one actionable line', async () => {
+  const { logger, lines } = captureLogs()
+  const gateway = stubGateway(() => 'error')
+  const recovery = startWithRecovery(gateway, logger, { budgetMs: 30, baseDelayMs: 5 })
+
+  await waitFor(
+    () => lines.some((line) => line.includes('every recovery attempt failed')),
+    { message: 'the budget was exhausted' },
+  )
+  const spent = gateway.starts
+  assert.ok(spent >= 2, `the whole budget was used, not one attempt: ${spent}`)
+
+  await delay(80)
+  assert.equal(gateway.starts, spent, 'nothing retries after the budget is spent')
+  assert.equal(lines.filter((line) => line.includes('every recovery attempt failed')).length, 1)
+  recovery.dispose()
+})
+
+test('a recovered channel gets a fresh budget when it fails again later', async () => {
+  const { logger } = captureLogs()
+  let healthy = true
+  const gateway = stubGateway(() => (healthy ? 'running' : 'error'))
+  const recovery = startWithRecovery(gateway, logger, { budgetMs: 20, baseDelayMs: 5 })
+  assert.equal(gateway.status, 'running')
+
+  await delay(60)
+  healthy = false
+  gateway.status = 'error'
+  gateway.onFatal(new Error('inbound tracking persistence failed'))
+
+  await waitFor(() => gateway.starts === 2, { message: 'the second episode retried' })
+  recovery.dispose()
+})
+
+test('disposing the plugin cancels a pending restart', async () => {
+  const { logger } = captureLogs()
+  const gateway = stubGateway(() => 'error')
+  const recovery = startWithRecovery(gateway, logger, { budgetMs: 5000, baseDelayMs: 20 })
+  await waitFor(() => gateway.starts === 1)
+
+  const fatal = gateway.onFatal
+  recovery.dispose()
+  assert.equal(gateway.onFatal, undefined)
+  fatal(new Error('a failure that lands after teardown'))
+
+  await delay(60)
+  assert.equal(gateway.starts, 1, 'neither the timer nor a late failure restarts a disposed channel')
+})
+
+test('a zero recovery budget reports the failure once and never restarts', async () => {
+  const { logger, lines } = captureLogs()
+  const gateway = stubGateway(() => 'error')
+  const recovery = startWithRecovery(gateway, logger, { budgetMs: 0 })
+
+  await waitFor(
+    () => lines.some((line) => line.includes('every recovery attempt failed')),
+    { message: 'the failure was reported' },
+  )
+  await delay(20)
+  assert.equal(gateway.starts, 1)
+  recovery.dispose()
+})
+
+test('a channel that fails at mount is restarted by the plugin', async (t) => {
+  const dir = await makeTempDir('plugin-recovery')
+  t.after(() => cleanup(dir))
+  await writeFile(join(dir, 'active-account.json'), '{broken-json')
+
+  const lines = []
+  t.mock.method(console, 'log', (...args) => lines.push(args.join(' ')))
+  t.mock.method(console, 'error', (...args) => lines.push(args.join(' ')))
+
+  const { ctx, record } = fakeCtx()
+  apply(ctx, { stateDir: dir, defaultCwd: process.cwd(), logLevel: 'debug' })
+
+  const failures = () => lines.filter((line) => line.includes('the WeChat gateway failed to start')).length
+  await waitFor(() => lines.some((line) => line.includes('the WeChat channel stopped; retrying')), {
+    message: 'the failure was announced as recoverable',
+  })
+  await waitFor(() => failures() >= 2, { message: 'the plugin started the channel again' })
+
+  await record.disposers[0]()
 })

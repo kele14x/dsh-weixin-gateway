@@ -3,7 +3,9 @@
  *
  * The plugin waits for `sessionController` (the `web` profile composes it) and
  * mounts the gateway on its own fiber, so a live patch reload disposes the
- * poller cleanly before the replacement starts.
+ * poller cleanly before the replacement starts. A channel that fails at runtime
+ * is restarted for a bounded window, because a stopped poller can neither report
+ * nor repair itself.
  *
  * @module dsh-weixin-gateway
  */
@@ -43,6 +45,115 @@ function isDirectory(path) {
     return statSync(path).isDirectory()
   } catch {
     return false
+  }
+}
+
+/** Recovery window after the channel reports a fatal error. */
+const RECOVERY_BUDGET_MS = 60_000
+
+/** First restart delay; it doubles after each attempt inside the window. */
+const RECOVERY_BASE_DELAY_MS = 1000
+
+/**
+ * Start the gateway and retry a fatal failure for a bounded window.
+ *
+ * A channel that reached `error` has stopped polling, so nothing inside it can
+ * report or repair the failure: no WeChat command can arrive and the Host has no
+ * readout of the channel. `Gateway.start()` already recovers from `error`, it
+ * just had no caller. Retry with a doubling delay for `budgetMs`, then give up
+ * with one actionable line, because a permanent misconfiguration must not emit a
+ * log line per interval for the rest of the process lifetime. A start that ends
+ * anywhere but `error` closes the episode, so a later failure gets a fresh
+ * budget.
+ *
+ * @param {import('./runtime.mjs').Gateway} gateway - channel to supervise.
+ * @param {object} logger - plugin logger.
+ * @param {object} [options] - overrides, for tests.
+ * @param {number} [options.budgetMs] - recovery window per episode; 0 disables retrying.
+ * @param {number} [options.baseDelayMs] - first retry delay.
+ * @returns {{dispose: () => Promise<void>|undefined}} handle; `dispose` cancels a pending retry and returns the in-flight attempt.
+ */
+export function startWithRecovery(gateway, logger, {
+  budgetMs = RECOVERY_BUDGET_MS,
+  baseDelayMs = RECOVERY_BASE_DELAY_MS,
+} = {}) {
+  let timer
+  let pending
+  let deadline = 0
+  let delay = baseDelayMs
+  let disposed = false
+  let exhausted = false
+
+  /**
+   * Queue the next restart, or give up once the episode budget is spent.
+   *
+   * One failure reaches this twice — through `onFatal` and through the rejected
+   * start — so a pending timer or a finished episode ends the call immediately.
+   *
+   * @param {Error} error - failure being recovered from.
+   * @returns {void}
+   */
+  function schedule(error) {
+    if (disposed || exhausted || timer !== undefined) return
+    if (deadline === 0) {
+      deadline = Date.now() + budgetMs
+      delay = baseDelayMs
+    }
+    const remaining = deadline - Date.now()
+    if (remaining <= 0) {
+      exhausted = true
+      logger.error(
+        'the WeChat channel stopped and every recovery attempt failed; restart the DSH Host to resume polling',
+        { reason: error?.message, retryWindowMs: budgetMs },
+      )
+      return
+    }
+    const wait = Math.min(delay, remaining)
+    delay *= 2
+    logger.warn('the WeChat channel stopped; retrying', { reason: error?.message, retryInMs: wait })
+    timer = setTimeout(() => {
+      timer = undefined
+      attempt()
+    }, wait)
+    timer.unref?.()
+  }
+
+  /** Run one start attempt and fold its outcome back into the episode. */
+  function attempt() {
+    if (disposed) return
+    const started = gateway.start().then(
+      () => {
+        // Anywhere but `error` ends the episode, so a later failure gets a fresh
+        // budget; `locked` and `unconfigured` have their own diagnostics.
+        if (gateway.status !== 'error') {
+          deadline = 0
+          exhausted = false
+        }
+      },
+      (error) => {
+        logger.error('the WeChat gateway failed to start', error)
+        schedule(error)
+      },
+    )
+    pending = started
+    started.then(() => {
+      if (pending === started) pending = undefined
+    })
+  }
+
+  gateway.onFatal = schedule
+  attempt()
+
+  return {
+    dispose() {
+      disposed = true
+      if (timer !== undefined) {
+        clearTimeout(timer)
+        timer = undefined
+      }
+      gateway.onFatal = undefined
+      return pending
+    },
   }
 }
 
@@ -110,20 +221,18 @@ export function apply(ctx, config) {
   ctx.inject(['sessionController'], (child) => {
     child.effect(() => {
       let gateway
-      let starting
+      let recovery
       try {
         const host = createHost(child, { logger })
         gateway = new Gateway({ config: resolvedConfig, host, workspace, logger })
-        starting = gateway.start().catch((error) => {
-          logger.error('the WeChat gateway failed to start', error)
-        })
+        recovery = startWithRecovery(gateway, logger)
       } catch (error) {
         logger.error('the WeChat gateway could not be created', error)
         return () => {}
       }
 
       return async () => {
-        await starting?.catch(() => {})
+        await recovery.dispose()?.catch(() => {})
         await gateway.stop().catch((error) => {
           logger.error('the WeChat gateway failed to stop cleanly', error)
         })

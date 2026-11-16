@@ -95,6 +95,17 @@ Phase 1 covers inbound images only:
   agent. A download cancelled by `/stop` is silent.
 - Turn timeout or a missing session: an actionable reply, never a fabricated
   answer.
+- Fatal channel errors: lock loss, a failed `-14` pause heartbeat, an inbound
+  journal write failure, and any startup failure all set `status = 'error'` and
+  stop polling. A stopped poller can neither report nor repair itself — no
+  WeChat command can arrive, and the Host has no readout of the channel — so the
+  gateway hands the failure to its owner through `onFatal` and the plugin
+  restarts it. Restarts use a doubling delay from 1 s inside a 60 s window, then
+  give up with one actionable log line rather than retrying a permanent
+  misconfiguration for the process lifetime. A start that ends anywhere but
+  `error` closes the episode, so a later failure gets a fresh window. Lock
+  conflicts are deliberately different: they retry every 30 s with no budget,
+  because the owning Host may exit at any moment.
 
 ## Security internals
 

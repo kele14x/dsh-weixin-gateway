@@ -119,6 +119,16 @@ export class Gateway {
     this.stopPromise = undefined
     this.drainPromises = new Set()
 
+    /**
+     * Called with the failure when the channel reaches `error`; assigned by the
+     * owner, which decides whether to restart. Polling has stopped by then, so
+     * this is the only signal that reaches anything — no WeChat command can
+     * arrive and the Host has no readout of the channel.
+     *
+     * @type {((error: Error) => void)|undefined}
+     */
+    this.onFatal = undefined
+
     /** @type {'stopped'|'starting'|'unconfigured'|'locked'|'running'|'paused'|'stopping'|'error'} */
     this.status = 'stopped'
     this.account = undefined
@@ -294,7 +304,7 @@ export class Gateway {
       await this.lock?.release().catch(() => {})
       this.lock = undefined
       if (signal.aborted) return
-      this.status = 'error'
+      this.#enterError(error)
       throw error
     }
   }
@@ -382,6 +392,28 @@ export class Gateway {
     if (this.lockRetryTimer === undefined) return
     clearTimeout(this.lockRetryTimer)
     this.lockRetryTimer = undefined
+  }
+
+  /**
+   * Record a terminal failure and hand it to the owner, which decides whether
+   * to restart.
+   *
+   * Polling has stopped by the time this runs, so no WeChat-side command can
+   * report the failure and `onFatal` is the only way out. A deliberate shutdown
+   * never reaches here: every path that aborts on purpose returns first.
+   *
+   * @param {Error} error - failure that stopped the channel.
+   * @returns {void}
+   */
+  #enterError(error) {
+    this.status = 'error'
+    this.abort?.abort()
+    if (typeof this.onFatal !== 'function') return
+    try {
+      this.onFatal(error)
+    } catch (listenerError) {
+      this.logger.warn('onFatal failed', { reason: listenerError.message })
+    }
   }
 
   /**
@@ -657,15 +689,13 @@ export class Gateway {
         }
         if (error.code === 'locked') {
           this.logger.error('poller lock ownership was lost; stopping polling', error)
-          this.status = 'error'
-          this.abort.abort()
+          this.#enterError(error)
           break
         }
         if (error.code === 'session-paused') {
           await this.#pauseForSession().catch((pauseError) => {
             this.logger.error('could not maintain the poller lock during the pause', pauseError)
-            this.status = 'error'
-            this.abort.abort()
+            this.#enterError(pauseError)
           })
           continue
         }
@@ -682,8 +712,7 @@ export class Gateway {
 
   #failInbound(error) {
     this.logger.error('inbound tracking persistence failed; stopping to avoid losing messages', error)
-    this.status = 'error'
-    this.abort.abort()
+    this.#enterError(error)
   }
 
   async #finishInbound(userId, messageId) {

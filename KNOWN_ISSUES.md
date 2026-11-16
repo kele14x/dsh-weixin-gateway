@@ -8,8 +8,6 @@ Findings are numbered once and keep their number forever, so gaps are expected. 
 
 ### P2
 
-- **24 — Nothing restarts a channel that reached `status = 'error'`**
-  Lock loss, a failed `-14` pause heartbeat, and an inbound-journal write failure all set `error` and stop polling. `Gateway.start()` already knows how to recover from `error` (it stops, then starts), but no caller invokes it: the plugin effect starts once at mount, and the retry timer only fires while `status === 'locked'`. One transient `ENOSPC` therefore disables the channel until the Host restarts. Polling has stopped, so the operator cannot even send `/status` to discover it — the only signal is a log line.
 - **25 — Inbound images have no aggregate bound**
   Each download is capped by `maxImageBytes` and `mediaTimeoutMs`, but the message total is not. At the defaults (9 images × 20 MB) the runtime holds ~180 MB of buffers and then base64-encodes them into one prompt payload (~240 MB of strings). The time is unbounded too: downloads run sequentially before `collector.begin()`, so `turnTimeoutMs` never covers them.
 
@@ -31,6 +29,8 @@ Findings are numbered once and keep their number forever, so gaps are expected. 
   `#loadImages` throws before the journal reaches `submitting`, so the accompanying text prompt is never submitted and the user only sees the image error. Their text is gone with no hint that it was dropped.
 - **34 — Minor cleanups**
   `scrub()`'s cycle guard shares one `seen` set down the whole tree and never pops, so a legitimately repeated (non-circular) object renders as `[circular]`. Dead code: an unused `LockError` import in `runtime.mjs`, and unreferenced exports `extractText` and `rawMessageId` in `ilink/messages.mjs`, plus `PACKAGE_NAME`, `MESSAGE_TYPE_USER`, `ITEM_TYPE_VOICE/FILE/VIDEO`, and `PATHS.uploadUrl` in `ilink/constants.mjs`.
+- **35 — `Gateway.summary()` has no caller**
+  It is documented as the non-secret runtime summary "for `/status` and diagnostics", but `/status` builds its own text in `statusText()` and nothing else reads it, so the plugin exposes no machine-readable channel state to the Host. That is why finding 24 left a log line as the only signal — and it still does once the 60 s restart budget is exhausted, because no Host-side readout reports that the channel is down. Found while fixing 24.
 
 ## Fixed issues
 
@@ -57,6 +57,7 @@ Findings 1–10 landed in `8d77e08`; 14–22 and 23 followed separately. All are
 - **17 — `logout` could reactivate a previously replaced account.** Persist an explicit active-account selection and clear it before deleting the credential; startup never falls back to older credentials. [CLI](test/cli.test.mjs), [gateway](test/gateway.test.mjs)
 - **18 — Same-value retries falsely acknowledged persistence.** Cursor and context-token setters flush pending writes even when the value is unchanged, including for concurrent callers. [state](test/state.test.mjs)
 - **19 — PID reuse prevented abandoned-lock recovery.** Persist boot identity and process start time and recover a local lock when the recorded generation differs; matching or unverifiable live owners stay protected regardless of heartbeat age. [lock](test/lock.test.mjs)
+- **24 — Nothing restarted a channel that reached `status = 'error'`.** Lock loss, a failed `-14` pause heartbeat, an inbound-journal write failure, and any startup failure stopped polling, and `Gateway.start()` already knew how to recover from `error` but had no caller: the plugin started once at mount and the retry timer only fired while `status === 'locked'`, so one transient `ENOSPC` disabled the channel until a Host restart. All four transitions now route through one `#enterError` that reports to the owner via `onFatal`, and the plugin restarts the channel with a doubling delay from 1 s inside a 60 s window, then gives up with one actionable log line; a start that ends anywhere but `error` closes the episode so a later failure gets a fresh window. Lock conflicts keep their unbudgeted 30 s retry, and a clean shutdown never reports a fatal error. [gateway](test/gateway.test.mjs), [plugin](test/plugin.test.mjs)
 - **26 — The API origin accepted any scheme, including a server-supplied one.** `normalizeBaseUrl` passed `http:` and `ftp:` through and kept URL userinfo, and QR login adopted the server's `redirect_host` and `baseurl` verbatim, so a cleartext origin could receive `Authorization: Bearer <botToken>` and be persisted for every later call. Origins are now parsed and must carry no credentials, query, or fragment; an operator-supplied origin requires https except on a loopback host, a server-supplied one requires https with no exception and fails login with `insecure-origin` instead of yielding credentials, and the config schema rejects a cleartext `baseUrl` before the channel mounts, and the CLI reports a rejected `--base-url` as a login failure rather than a stack trace. [client](test/client.test.mjs), [auth](test/auth.test.mjs), [CLI](test/cli.test.mjs), [plugin](test/plugin.test.mjs)
 
 ### P3
@@ -81,7 +82,7 @@ These are design boundaries, not defects.
 
 The per-change test counts that used to accumulate here are in the git history, and the README carries the current total. What follows are the durable caveats, which apply to every fix recorded above.
 
-- Everything is offline: fake iLink and Host interfaces, temporary fixtures, loopback HTTP, child processes, and offline readline streams. The current suite is 511 tests.
+- Everything is offline: fake iLink and Host interfaces, temporary fixtures, loopback HTTP, child processes, and offline readline streams. The current suite is 522 tests.
 - **No live WeChat account, CDN, or DSH Host has ever been exercised.** The iLink wire format, QR states, and CDN media rules are reverse-engineered from Tencent's client behaviour, so every protocol assumption in this repository is unverified against production. This is the single largest source of residual risk and no offline test can close it.
 - Process-identity evidence is partly simulated: PID reuse and boot changes were injected rather than triggered through real OS PID recycling, Linux `/proc` parsing used fixtures, and native macOS probes were checked across differing locale/timezone settings. The identity test tolerates a sandbox that cannot execute setuid `/bin/ps` and asserts the documented heartbeat fallback there.
 - Lock contention was measured with 100 fresh and 100 stale trials at five contenders each, plus separate-process contention for both cases. That is regression evidence, not proof of every schedule or filesystem behaviour.

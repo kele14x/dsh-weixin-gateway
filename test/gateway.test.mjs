@@ -962,6 +962,91 @@ test('a corrupt state file fails startup instead of dropping session mappings', 
   assert.equal(gateway.status, 'error')
 })
 
+test('a failed startup is reported to the owner, and a clean shutdown is not', async (t) => {
+  const { accounts, gateway } = await setup(t)
+  const fatal = []
+  gateway.onFatal = (error) => fatal.push(error)
+
+  await gateway.start()
+  assert.equal(gateway.status, 'running')
+  await gateway.stop()
+  assert.deepEqual(fatal, [])
+
+  await writeFile(accounts.activeFile, '{broken-json')
+  await assert.rejects(() => gateway.start(), /not valid JSON/)
+  assert.equal(gateway.status, 'error')
+  assert.equal(fatal.length, 1)
+  assert.match(fatal[0].message, /not valid JSON/)
+})
+
+test('losing the poller lock is reported to the owner', async (t) => {
+  const { client, gateway } = await setup(t)
+  await gateway.start()
+  const fatal = []
+  gateway.onFatal = (error) => fatal.push(error)
+
+  gateway.lock.touch = async () => {
+    throw new LockError('ownership lost')
+  }
+  client.push({ msgs: [] })
+
+  await waitFor(() => fatal.length === 1, { message: 'the owner learned the channel stopped' })
+  assert.equal(gateway.status, 'error')
+  assert.equal(fatal[0].code, 'locked')
+})
+
+test('an inbound journal write failure is reported to the owner', async (t) => {
+  const { client, gateway } = await setup(t)
+  await gateway.start()
+  const fatal = []
+  gateway.onFatal = (error) => fatal.push(error)
+
+  const full = new Error('no space left on device')
+  full.code = 'inbound-persistence'
+  gateway.inbound.record = async () => {
+    throw full
+  }
+  client.push({ msgs: [textMessage()] })
+
+  await waitFor(() => fatal.length === 1, { message: 'the owner learned the channel stopped' })
+  assert.equal(gateway.status, 'error')
+  assert.equal(fatal[0], full)
+})
+
+test('a failed pause heartbeat is reported to the owner', async (t) => {
+  const { client, gateway } = await setup(t, {
+    config: { sessionPauseMs: 200 },
+    gatewayOptions: { pauseHeartbeatMs: 5 },
+  })
+  await gateway.start()
+  const fatal = []
+  gateway.onFatal = (error) => fatal.push(error)
+
+  client.pausedOnce = 'pending'
+  gateway.lock.touch = async () => {
+    throw new LockError('heartbeat lost')
+  }
+  client.push({ msgs: [] })
+
+  await waitFor(() => fatal.length === 1, { message: 'the owner learned the channel stopped' })
+  assert.equal(gateway.status, 'error')
+  assert.match(fatal[0].message, /heartbeat lost/)
+})
+
+test('an owner listener that throws cannot mask the channel failure', async (t) => {
+  const { accounts, gateway } = await setup(t)
+  await writeFile(accounts.activeFile, '{broken-json')
+  let notified = 0
+  gateway.onFatal = () => {
+    notified += 1
+    throw new Error('listener bug')
+  }
+
+  await assert.rejects(() => gateway.start(), /not valid JSON/)
+  assert.equal(gateway.status, 'error')
+  assert.equal(notified, 1, 'the owner was notified even though its listener threw')
+})
+
 test('a code issued while the gateway runs pairs a sender without a restart', async (t) => {
   const previous = process.env.DSH_WEIXIN_BIND_CODE
   delete process.env.DSH_WEIXIN_BIND_CODE
