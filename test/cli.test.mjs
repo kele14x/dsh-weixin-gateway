@@ -165,6 +165,18 @@ test('a failed forced login keeps the previous active account', async (t) => {
   assert.equal((await accounts.active()).botId, 'old-bot')
 })
 
+test('a cleartext --base-url is reported instead of throwing out of the CLI', async (t) => {
+  const output = captureOutput(t)
+  const stateDir = await makeTempDir('cli-insecure-origin')
+  t.after(() => cleanup(stateDir))
+
+  assert.equal(await main(['login', '--state-dir', stateDir, '--base-url', 'http://api.test', '--no-qr']), 1)
+  assert.ok(
+    output.errors.some((line) => line.startsWith('Login failed') && line.includes('must use https')),
+    output.errors.join('\n'),
+  )
+})
+
 test('removing an inactive credential keeps the selected account', async (t) => {
   const stateDir = await makeTempDir('cli-inactive-account')
   t.after(() => cleanup(stateDir))

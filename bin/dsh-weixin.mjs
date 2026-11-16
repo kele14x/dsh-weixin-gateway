@@ -142,15 +142,15 @@ async function login(options, accounts) {
   }
 
   console.log('Starting WeChat QR login ...')
-  const client = new ILinkClient({
-    baseUrl: options.baseUrl,
-    botAgent: botAgentFor(VERSION),
-  })
-
   const readline = createInterface({ input: process.stdin, output: process.stdout })
   const io = createLoginIo(readline)
 
   try {
+    const client = new ILinkClient({
+      baseUrl: options.baseUrl,
+      botAgent: botAgentFor(VERSION),
+    })
+
     const credentials = await runQrLogin({
       client,
       io,

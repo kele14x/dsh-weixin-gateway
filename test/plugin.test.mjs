@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { mkdir, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { Config, apply, name } from '../src/index.mjs'
-import { DEFAULT_POLL_TIMEOUT_MS, MAX_POLL_TIMEOUT_MS } from '../src/ilink/constants.mjs'
+import { DEFAULT_BASE_URL, DEFAULT_POLL_TIMEOUT_MS, MAX_POLL_TIMEOUT_MS } from '../src/ilink/constants.mjs'
 import { cleanup, makeTempDir, waitFor } from './helpers/tmp.mjs'
 
 /**
@@ -81,6 +81,17 @@ test('the config schema rejects a zero image byte cap', () => {
 test('the config schema rejects a zero chunk size', () => {
   assert.throws(() => Config({ stateDir: '/tmp/state', maxMessageChars: 0 }))
   assert.equal(Config({ stateDir: '/tmp/state', maxMessageChars: 1 }).maxMessageChars, 1)
+})
+
+test('the config schema rejects an API origin that would send the bot token in cleartext', () => {
+  assert.equal(Config({ stateDir: '/tmp/state' }).baseUrl, DEFAULT_BASE_URL)
+  assert.equal(Config({ stateDir: '/tmp/state', baseUrl: '' }).baseUrl, '')
+  for (const value of ['https://api.test/base', 'ilinkai.weixin.qq.com', 'http://127.0.0.1:8080']) {
+    assert.equal(Config({ stateDir: '/tmp/state', baseUrl: value }).baseUrl, value, value)
+  }
+  for (const value of ['http://api.test', 'ftp://api.test', 'https://user:pass@api.test', 'https://api.test?q=1']) {
+    assert.throws(() => Config({ stateDir: '/tmp/state', baseUrl: value }), undefined, value)
+  }
 })
 
 test('the config schema rejects a poll budget that could outlive the lock heartbeat', () => {

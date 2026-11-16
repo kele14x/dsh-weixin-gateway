@@ -140,7 +140,7 @@ single-poller lock, retry/backoff, and `-14` handling — are in `AGENTS.md`.
 npm test
 ```
 
-503 offline tests using fake iLink/Host interfaces and disposable fixtures — no
+511 offline tests using fake iLink/Host interfaces and disposable fixtures — no
 WeChat account is used.
 
 ## Limitations

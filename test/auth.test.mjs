@@ -99,6 +99,37 @@ test('a scanned redirect switches the API origin before continuing', async () =>
   assert.equal(client.calls.length, 2)
 })
 
+test('a redirect to a cleartext origin is refused instead of adopted', async () => {
+  const client = authClient([{ status: 'scaned_but_redirect', redirect_host: 'http://evil.test' }])
+  await assert.rejects(
+    () => runQrLogin({ client, io: fakeIo(), pollIntervalMs: 1, timeoutMs: 1000 }),
+    (error) => error instanceof LoginError && error.code === 'insecure-origin',
+  )
+  assert.equal(client.baseUrl, 'https://start.test')
+})
+
+test('a blank redirect_host leaves the API origin alone', async () => {
+  const client = authClient([
+    { status: 'scaned_but_redirect', redirect_host: '   ' },
+    { status: 'confirmed', bot_token: 't', ilink_bot_id: 'b' },
+  ])
+
+  const credentials = await runQrLogin({ client, io: fakeIo(), pollIntervalMs: 1, timeoutMs: 1000 })
+
+  assert.equal(credentials.baseUrl, 'https://start.test')
+})
+
+test('a confirmed login yields no credentials when the server downgrades the origin', async () => {
+  const client = authClient([
+    { status: 'confirmed', bot_token: 't', ilink_bot_id: 'b', baseurl: 'http://127.0.0.1:8080' },
+  ])
+  await assert.rejects(
+    () => runQrLogin({ client, io: fakeIo(), pollIntervalMs: 1, timeoutMs: 1000 }),
+    (error) =>
+      error instanceof LoginError && error.code === 'insecure-origin' && /API origin/.test(error.message),
+  )
+})
+
 test('an expired QR code fails with an actionable code', async () => {
   const client = authClient([{ status: 'expired' }])
   await assert.rejects(

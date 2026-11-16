@@ -5,6 +5,7 @@ import {
   ILinkError,
   SessionPausedError,
   normalizeBaseUrl,
+  normalizeServerOrigin,
 } from '../src/ilink/client.mjs'
 import { encodeClientVersion, VERSION } from '../src/ilink/constants.mjs'
 import { withHttpServer } from './helpers/fake-client.mjs'
@@ -18,6 +19,42 @@ test('encodeClientVersion packs 0x00MMNNPP as a decimal string', () => {
 test('normalizeBaseUrl accepts hosts and strips trailing slashes', () => {
   assert.equal(normalizeBaseUrl('ilinkai.weixin.qq.com/'), 'https://ilinkai.weixin.qq.com')
   assert.equal(normalizeBaseUrl('http://127.0.0.1:8080/'), 'http://127.0.0.1:8080')
+})
+
+test('normalizeBaseUrl refuses an origin that would leak the bot token', () => {
+  const insecure = (error) => error instanceof ILinkError && error.code === 'insecure-origin'
+  const rejected = [
+    'http://api.test',
+    'ftp://api.test',
+    'https://user:pass@api.test',
+    'https://api.test?q=1',
+    'https://api.test#fragment',
+    'api.test not a url',
+  ]
+  for (const value of rejected) {
+    assert.throws(() => normalizeBaseUrl(value), insecure, value)
+  }
+})
+
+test('a loopback origin is an operator convenience, never a server one', () => {
+  for (const value of ['http://127.0.0.1:8080', 'http://localhost:8080', 'http://[::1]:8080']) {
+    assert.equal(normalizeBaseUrl(value), value)
+    assert.throws(() => normalizeServerOrigin(value), { code: 'insecure-origin' }, value)
+  }
+  assert.equal(normalizeServerOrigin('other.example/'), 'https://other.example')
+})
+
+test('the client refuses an insecure origin and keeps the previous one on a bad switch', () => {
+  assert.throws(() => new ILinkClient({ baseUrl: 'http://api.test', botToken: 'tok' }), {
+    code: 'insecure-origin',
+  })
+
+  const client = new ILinkClient({ baseUrl: 'https://api.test', botToken: 'tok' })
+  assert.throws(() => client.setBaseUrl('http://api.test'), { code: 'insecure-origin' })
+  assert.equal(client.baseUrl, 'https://api.test')
+
+  client.setBaseUrl('https://other.example/')
+  assert.equal(client.baseUrl, 'https://other.example')
 })
 
 test('header sets differ per request class', () => {

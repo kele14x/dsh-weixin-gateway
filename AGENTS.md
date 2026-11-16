@@ -112,6 +112,12 @@ Phase 1 covers inbound images only:
 - Tokens, context tokens, QR URLs, media AES keys, CDN query parameters, and
   message text are redacted from logs. Raw message text appears only when
   `debugLogContent` is on.
+- The API origin must be https and carry no credentials, query, or fragment. The
+  one exception is an operator-supplied loopback `baseUrl`, which offline tests
+  and local mocks need; a QR-supplied `redirect_host` or `baseurl` gets no
+  exception, so the server cannot downgrade the origin that later receives
+  `Authorization: Bearer <botToken>` — login fails with `insecure-origin` rather
+  than storing it. The config schema rejects a cleartext origin before mount.
 - Media downloads are bounded by bytes and time, accept only HTTPS WeChat CDN
   hosts (including the configured CDN origin), and never receive the bot
   `Authorization` header.
@@ -130,7 +136,7 @@ optional: empty (the default) uses the plugin's own `workspace/` directory, and
 | `defaultCwd` | `<plugin>/workspace` | workspace for new sessions |
 | `workspaceTitle` | `WeChat` | sidebar group title; empty leaves sessions ungrouped |
 | `agentPreset` | — | preset for new sessions |
-| `baseUrl` | iLink default | API origin; a QR redirect may override it per account |
+| `baseUrl` | iLink default | API origin, https only (a loopback host may use http); a QR redirect may override it per account |
 | `mediaEnabled` | `true` | download inbound images and pass them to the agent |
 | `cdnBaseUrl` | iLink CDN default | CDN origin used when a message has no `full_url` |
 | `maxImageBytes` | `20971520` | maximum downloaded bytes for one inbound image |

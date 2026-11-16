@@ -65,17 +65,78 @@ export class SessionPausedError extends ILinkError {
   }
 }
 
+/** Hosts allowed to speak cleartext HTTP, for offline tests and local mocks. */
+const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]'])
+
+const SCHEME = /^([A-Za-z][A-Za-z0-9+.-]*):\/\//
+
 /**
- * Normalize a base URL or bare host into an origin.
+ * Parse one API origin and reject a value that would leak the bot token.
+ *
+ * Every authenticated call sends `Authorization: Bearer <botToken>` to this
+ * origin, so a cleartext or credential-carrying value is a disclosure path
+ * rather than a cosmetic misconfiguration.
+ *
+ * @param {string} value - origin or bare host, optionally with a trailing slash.
+ * @param {boolean} allowLoopbackHttp - accept `http:` for a loopback host.
+ * @returns {string} origin without a trailing slash.
+ * @throws {ILinkError} code `insecure-origin` when the value cannot be used safely.
+ */
+function toApiOrigin(value, allowLoopbackHttp) {
+  const text = String(value ?? '').trim()
+  if (text.length === 0) return DEFAULT_BASE_URL
+
+  const scheme = SCHEME.exec(text)
+  if (scheme !== null && !/^https?$/i.test(scheme[1])) {
+    throw new ILinkError(`API origin has an unsupported scheme: ${scheme[1]}`, { code: 'insecure-origin' })
+  }
+
+  let url
+  try {
+    url = new URL(scheme !== null ? text : `https://${text}`)
+  } catch (error) {
+    throw new ILinkError('API origin is not a valid URL', { code: 'insecure-origin', cause: error })
+  }
+
+  const loopback = LOOPBACK_HOSTS.has(url.hostname.toLowerCase())
+  if (url.protocol !== 'https:' && !(allowLoopbackHttp && url.protocol === 'http:' && loopback)) {
+    throw new ILinkError(`API origin must use https: ${url.protocol}//${url.host}`, { code: 'insecure-origin' })
+  }
+  if (url.username.length > 0 || url.password.length > 0 || url.search.length > 0 || url.hash.length > 0) {
+    throw new ILinkError('API origin must not carry credentials, a query, or a fragment', {
+      code: 'insecure-origin',
+    })
+  }
+  return url.toString().replace(/\/+$/, '')
+}
+
+/**
+ * Normalize an operator-supplied base URL or bare host into an origin.
+ *
+ * `http:` is accepted only for a loopback host, so offline tests and local mocks
+ * work while a remote cleartext downgrade does not.
  *
  * @param {string} value - origin or host, optionally with a trailing slash.
  * @returns {string} origin without a trailing slash.
+ * @throws {ILinkError} code `insecure-origin` when the value cannot be used safely.
  */
 export function normalizeBaseUrl(value) {
-  const text = String(value ?? '').trim()
-  if (text.length === 0) return DEFAULT_BASE_URL
-  const withScheme = /^https?:\/\//i.test(text) ? text : `https://${text}`
-  return withScheme.replace(/\/+$/, '')
+  return toApiOrigin(value, true)
+}
+
+/**
+ * Normalize an origin the iLink server supplied during QR login.
+ *
+ * The server chooses `redirect_host` and `baseurl`, and that value is persisted
+ * into the account record and reused for every later authenticated call, so it
+ * gets no cleartext allowance at all.
+ *
+ * @param {string} value - origin or host, optionally with a trailing slash.
+ * @returns {string} https origin without a trailing slash.
+ * @throws {ILinkError} code `insecure-origin` when the value cannot be used safely.
+ */
+export function normalizeServerOrigin(value) {
+  return toApiOrigin(value, false)
 }
 
 /**
@@ -92,7 +153,7 @@ function randomWechatUin() {
 export class ILinkClient {
   /**
    * @param {object} options - client options.
-   * @param {string} [options.baseUrl] - API origin.
+   * @param {string} [options.baseUrl] - API origin; https, or http for a loopback host.
    * @param {string} [options.botToken] - bearer token; required by authenticated calls.
    * @param {string} [options.clientVersion] - encoded client version header value.
    * @param {string} [options.packageVersion] - `channel_version` value.
@@ -137,11 +198,12 @@ export class ILinkClient {
   /**
    * Switch origin after a QR redirect.
    *
-   * @param {string} value - new origin or host.
+   * @param {string} value - new origin or host; https only, no loopback allowance.
    * @returns {void}
+   * @throws {ILinkError} code `insecure-origin`, leaving the current origin in place.
    */
   setBaseUrl(value) {
-    this._baseUrl = normalizeBaseUrl(value)
+    this._baseUrl = normalizeServerOrigin(value)
   }
 
   /**

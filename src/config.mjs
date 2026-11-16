@@ -22,6 +22,17 @@ import {
 /** Sidebar group title used when the operator configures none. */
 export const DEFAULT_WORKSPACE_TITLE = 'WeChat'
 
+/**
+ * Accepted shapes for `baseUrl`: empty (the default origin), an https origin, a
+ * bare host, or `http:` for a loopback host so offline tests and local mocks
+ * still work. Credentials, queries, and fragments are rejected;
+ * `normalizeBaseUrl` enforces the same rule at request time. Rejecting it here
+ * means the settings surface reports a cleartext origin instead of the channel
+ * failing once it mounts.
+ */
+const SECURE_BASE_URL =
+  /^(?:$|(?:https:\/\/[^\s@/?#]+|http:\/\/(?:localhost|127\.0\.0\.1|\[::1\])(?::\d+)?|[A-Za-z0-9][A-Za-z0-9.-]*(?::\d+)?)(?:\/[^\s?#]*)?)$/
+
 /** Configuration accepted by the WeChat channel plugin. */
 export const Config = z.object({
   stateDir: z
@@ -45,8 +56,11 @@ export const Config = z.object({
     ),
   baseUrl: z
     .string()
+    .pattern(SECURE_BASE_URL)
     .default(DEFAULT_BASE_URL)
-    .description('iLink API origin. A QR redirect may override it for the saved account.'),
+    .description(
+      'iLink API origin; https only, except http for a loopback host. A QR redirect may override it for the saved account.',
+    ),
   mediaEnabled: z
     .boolean()
     .default(true)

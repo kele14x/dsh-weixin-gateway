@@ -4,11 +4,14 @@
  * The state machine is exactly the eight statuses Tencent's protocol documents.
  * Two of them carry a `redirect_host` and require switching the API origin
  * before polling again, which is why the client passed in here is mutated
- * rather than a fresh one being built.
+ * rather than a fresh one being built. Both that redirect and the confirmed
+ * `baseurl` are server-supplied and end up in the account record, so each is
+ * validated as an https-only origin before it is used.
  *
  * @module dsh-weixin-gateway/ilink/auth
  */
 
+import { normalizeServerOrigin } from './client.mjs'
 import { sleep } from '../util/time.mjs'
 import { silentLogger } from '../util/log.mjs'
 
@@ -67,6 +70,22 @@ async function promptVerification(io, remaining, signal) {
     clearTimeout(timer)
     signal?.removeEventListener('abort', onAbort)
     input.abort()
+  }
+}
+
+/**
+ * Validate an origin the server chose for later authenticated calls.
+ *
+ * @param {string} value - server-supplied origin or host.
+ * @param {string} field - human-facing field name used in the failure message.
+ * @returns {string} https origin.
+ * @throws {LoginError} code `insecure-origin` when the value is not safely usable.
+ */
+function serverOrigin(value, field) {
+  try {
+    return normalizeServerOrigin(value)
+  } catch (error) {
+    throw new LoginError('insecure-origin', `refusing the server-supplied ${field}: ${error.message}`)
   }
 }
 
@@ -162,9 +181,9 @@ export async function runQrLogin({
     }
 
     // A redirect can arrive with more than one status; honour it whenever sent.
-    if (typeof status?.redirect_host === 'string' && status.redirect_host.length > 0) {
+    if (typeof status?.redirect_host === 'string' && status.redirect_host.trim().length > 0) {
       const previous = client.baseUrl
-      client.setBaseUrl(status.redirect_host)
+      client.setBaseUrl(serverOrigin(status.redirect_host, 'login redirect'))
       if (client.baseUrl !== previous) {
         io.print(`Login redirected to ${client.baseUrl}.`)
       }
@@ -206,8 +225,8 @@ export async function runQrLogin({
         return {
           botToken: status.bot_token,
           botId: status.ilink_bot_id,
-          baseUrl: typeof status.baseurl === 'string' && status.baseurl.length > 0
-            ? status.baseurl
+          baseUrl: typeof status.baseurl === 'string' && status.baseurl.trim().length > 0
+            ? serverOrigin(status.baseurl, 'API origin')
             : client.baseUrl,
           ...(typeof status.ilink_user_id === 'string' && status.ilink_user_id.length > 0
             ? { ownerUserId: status.ilink_user_id }
