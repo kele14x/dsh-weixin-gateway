@@ -10,6 +10,7 @@ import { issuePairingCode } from '../src/store/pairing.mjs'
 import { ChannelState } from '../src/store/state.mjs'
 import { InboundJournal } from '../src/store/inbound.mjs'
 import { acquireLock, LockError } from '../src/store/lock.mjs'
+import { MAX_POLL_TIMEOUT_MS } from '../src/ilink/constants.mjs'
 import { createLogger } from '../src/util/log.mjs'
 import { FakeClient } from './helpers/fake-client.mjs'
 import { FakeHost } from './helpers/fake-host.mjs'
@@ -557,6 +558,24 @@ test('a -14 pause keeps the poller lock warm', async (t) => {
   await waitFor(() => client.pausedOnce === 'done', { message: 'pause observed' })
   await waitFor(() => gateway.status === 'running', { message: 'resumed' })
   assert.ok(touches >= 5, `expected repeated lock heartbeats during the pause, saw ${touches}`)
+})
+
+test('an out-of-range server poll budget is clamped and polling continues', async (t) => {
+  const { client, gateway } = await setup(t)
+  await gateway.start()
+
+  // Adopted verbatim this value would make every later request throw before it
+  // reached the network, and only a successful poll could reset it.
+  client.push({ msgs: [], getUpdatesBuf: 'cursor-a', longPollingTimeoutMs: 5e9 })
+  await waitFor(() => gateway.pollTimeoutMs === MAX_POLL_TIMEOUT_MS, { message: 'budget clamped' })
+
+  client.push({ msgs: [textMessage()], getUpdatesBuf: 'cursor-b' })
+  await waitFor(() => client.sent.length === 1, { message: 'still polling after the clamp' })
+  assert.equal(gateway.status, 'running')
+  assert.ok(
+    client.pollTimeouts.every((value) => value <= MAX_POLL_TIMEOUT_MS),
+    `every poll must ask for a bounded budget, saw ${client.pollTimeouts.join(', ')}`,
+  )
 })
 
 test('a failed command does not skip later messages in its batch', async (t) => {

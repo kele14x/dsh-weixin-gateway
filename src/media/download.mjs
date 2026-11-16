@@ -10,7 +10,7 @@
  * @module dsh-weixin-gateway/media/download
  */
 
-import { DEFAULT_CDN_BASE } from '../ilink/constants.mjs'
+import { DEFAULT_CDN_BASE, MAX_TIMEOUT_MS } from '../ilink/constants.mjs'
 import { MediaError } from './errors.mjs'
 import { decryptAesEcb, imageAesKey } from './crypto.mjs'
 
@@ -176,7 +176,7 @@ export class MediaDownloader {
   async #download(url, signal) {
     this.#assertUrl(url)
 
-    const deadline = AbortSignal.timeout(Math.min(this.timeoutMs, 2_147_483_647))
+    const deadline = AbortSignal.timeout(Math.min(this.timeoutMs, MAX_TIMEOUT_MS))
     const combined = signal ? AbortSignal.any([signal, deadline]) : deadline
     let response
     try {

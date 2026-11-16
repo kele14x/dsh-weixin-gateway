@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import { mkdir, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { Config, apply, name } from '../src/index.mjs'
+import { DEFAULT_POLL_TIMEOUT_MS, MAX_POLL_TIMEOUT_MS } from '../src/ilink/constants.mjs'
 import { cleanup, makeTempDir, waitFor } from './helpers/tmp.mjs'
 
 /**
@@ -80,6 +81,17 @@ test('the config schema rejects a zero image byte cap', () => {
 test('the config schema rejects a zero chunk size', () => {
   assert.throws(() => Config({ stateDir: '/tmp/state', maxMessageChars: 0 }))
   assert.equal(Config({ stateDir: '/tmp/state', maxMessageChars: 1 }).maxMessageChars, 1)
+})
+
+test('the config schema rejects a poll budget that could outlive the lock heartbeat', () => {
+  assert.equal(Config({ stateDir: '/tmp/state' }).pollTimeoutMs, DEFAULT_POLL_TIMEOUT_MS)
+  assert.equal(
+    Config({ stateDir: '/tmp/state', pollTimeoutMs: MAX_POLL_TIMEOUT_MS }).pollTimeoutMs,
+    MAX_POLL_TIMEOUT_MS,
+  )
+  for (const value of [0, MAX_POLL_TIMEOUT_MS + 1, 5e9]) {
+    assert.throws(() => Config({ stateDir: '/tmp/state', pollTimeoutMs: value }), undefined, `${value}`)
+  }
 })
 
 test('a relative stateDir disables the channel instead of mounting', () => {

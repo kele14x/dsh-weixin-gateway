@@ -78,6 +78,13 @@ Phase 1 covers inbound images only:
   conservative fallback. Older locks without generation metadata may still need
   operator inspection.
 - Long-poll or network errors: exponential backoff (1 s → 60 s), cursor kept.
+- Long-poll budget: both the configured value and the server-suggested
+  `longpolling_timeout_ms` are capped at `MAX_POLL_TIMEOUT_MS`, and every request
+  clamps its timer to `MAX_TIMEOUT_MS`. Node throws above 2^32-1 ms and silently
+  truncates above 2^31-1 ms, so an out-of-range server value adopted verbatim
+  would make every later request fail before it reached the network — and only a
+  successful poll could reset it, wedging the channel for the process lifetime.
+  The cap also keeps one silent poll under the poller lock's 120 s stale window.
 - Send errors: one retry on a plain network failure, reusing the per-chunk
   `clientId` as a server-side deduplication hint, then log; never claims success.
 - QR login: HTTP requests use the remaining overall login budget, capped by the
@@ -131,7 +138,7 @@ optional: empty (the default) uses the plugin's own `workspace/` directory, and
 | `mediaTimeoutMs` | `60000` | total deadline for one inbound media download |
 | `maxMessageChars` | `1800` | outbound chunk size (code points) |
 | `chunkDelayMs` | `400` | delay between outbound chunks |
-| `pollTimeoutMs` | iLink default | long-poll budget; the server value wins when present |
+| `pollTimeoutMs` | iLink default | long-poll budget, capped at `MAX_POLL_TIMEOUT_MS`; the server value wins when present, also capped |
 | `queueLimit` | `8` | max queued inbound messages per sender |
 | `turnTimeoutMs` | `600000` | how long to wait for one DSH turn |
 | `typingKeepaliveMs` | `5000` | re-send the WeChat typing banner while a turn runs; `0` disables the refresh |

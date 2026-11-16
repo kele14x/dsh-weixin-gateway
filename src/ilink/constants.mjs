@@ -49,6 +49,21 @@ export const PATHS = Object.freeze({
 /** Server-suggested long-poll budget (response field `longpolling_timeout_ms`). */
 export const DEFAULT_POLL_TIMEOUT_MS = 35_000
 
+/**
+ * Largest delay `AbortSignal.timeout` accepts: Node truncates anything above
+ * 2^31 - 1 to 1 ms and throws above 2^32 - 1.
+ */
+export const MAX_TIMEOUT_MS = 2_147_483_647
+
+/**
+ * Upper bound for one long poll, applied to the configured budget and to the
+ * server-suggested one. A poll blocks the loop that refreshes the poller lock,
+ * so the budget stays under the lock's 120 s stale window. An out-of-range
+ * server value is clamped, not adopted: adopted verbatim it would make every
+ * later request throw and wedge polling for the life of the process.
+ */
+export const MAX_POLL_TIMEOUT_MS = 90_000
+
 /** A `-14` response pauses the account session for one hour. */
 export const SESSION_PAUSED_MS = 60 * 60 * 1000
 

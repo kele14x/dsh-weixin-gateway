@@ -172,6 +172,39 @@ test('getUpdates passes the cursor and reads the new one', async () => {
   )
 })
 
+test('an out-of-range request timeout is clamped instead of throwing', async () => {
+  await withHttpServer(
+    () => ({ body: { ret: 0, msgs: [], get_updates_buf: 'next' } }),
+    async ({ baseUrl, requests }) => {
+      const client = new ILinkClient({ baseUrl, botToken: 'tok' })
+      // Node throws ERR_OUT_OF_RANGE above 2^32-1 and silently truncates the
+      // timer to 1 ms above 2^31-1; either would break the poll loop.
+      for (const timeoutMs of [4_294_967_296, 5e9, Infinity]) {
+        const batch = await client.getUpdates({ cursor: '', timeoutMs })
+        assert.equal(batch.timedOut, false)
+      }
+      assert.equal(requests.length, 3, 'every clamped request still reached the server')
+    },
+  )
+})
+
+test('a timeout in Node\'s truncation range still allows a slow response', async () => {
+  await withHttpServer(
+    async () => {
+      await new Promise((resolve) => setTimeout(resolve, 100))
+      return { body: { ret: 0, msgs: [], get_updates_buf: 'next' } }
+    },
+    async ({ baseUrl }) => {
+      const client = new ILinkClient({ baseUrl, botToken: 'tok' })
+      // Node accepts 2^32-1 but truncates the timer to 1 ms, which would abort
+      // this 100 ms response; clamping to 2^31-1 keeps it a real deadline.
+      const batch = await client.getUpdates({ cursor: '', timeoutMs: 4_294_967_295 })
+      assert.equal(batch.timedOut, false)
+      assert.equal(batch.getUpdatesBuf, 'next')
+    },
+  )
+})
+
 test('getUpdates maps a long-poll timeout to an empty batch', async () => {
   await withHttpServer(
     async () => {

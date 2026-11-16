@@ -23,6 +23,7 @@ import {
   DEFAULT_BASE_URL,
   DEFAULT_POLL_TIMEOUT_MS,
   ITEM_TYPE_TEXT,
+  MAX_TIMEOUT_MS,
   MESSAGE_STATE_COMPLETE,
   OUTBOUND_MESSAGE_TYPE,
   PATHS,
@@ -204,7 +205,7 @@ export class ILinkClient {
       ? { ...body, ...(kind === 'bot' ? { base_info: this.baseInfo() } : {}) }
       : undefined
 
-    const timeoutSignal = AbortSignal.timeout(Math.max(1, timeoutMs))
+    const timeoutSignal = AbortSignal.timeout(Math.min(Math.max(1, timeoutMs), MAX_TIMEOUT_MS))
     const combined = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal
     let response
     let text

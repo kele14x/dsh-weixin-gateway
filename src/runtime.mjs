@@ -22,6 +22,7 @@ import { normalizeInbound, isGroupMessage } from './ilink/messages.mjs'
 import { ILinkClient } from './ilink/client.mjs'
 import {
   DEFAULT_CDN_BASE,
+  MAX_POLL_TIMEOUT_MS,
   TYPING_START,
   TYPING_STOP,
   VERSION,
@@ -629,7 +630,7 @@ export class Gateway {
         backoff = 1000
 
         if (typeof batch.longPollingTimeoutMs === 'number' && batch.longPollingTimeoutMs > 0) {
-          this.pollTimeoutMs = batch.longPollingTimeoutMs
+          this.pollTimeoutMs = Math.min(batch.longPollingTimeoutMs, MAX_POLL_TIMEOUT_MS)
         }
         await this.lock.touch()
 

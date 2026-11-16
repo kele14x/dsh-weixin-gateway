@@ -25,19 +25,36 @@ export class FakeClient {
     this.pausedOnce = false
     this.waiter = undefined
     this.aborted = false
+    /** @type {number[]} every long-poll budget the gateway asked for */
+    this.pollTimeouts = []
+  }
+
+  /**
+   * Shape one queued batch as the client's `getUpdates` result.
+   *
+   * @param {object} batch - queued batch.
+   * @returns {object} client batch.
+   */
+  static batchOf(batch) {
+    return {
+      msgs: batch.msgs ?? [],
+      getUpdatesBuf: batch.getUpdatesBuf,
+      ...(batch.longPollingTimeoutMs === undefined ? {} : { longPollingTimeoutMs: batch.longPollingTimeoutMs }),
+      timedOut: false,
+    }
   }
 
   /**
    * Queue a batch for the next poll.
    *
-   * @param {{msgs: object[], getUpdatesBuf?: string}} batch - batch.
+   * @param {{msgs: object[], getUpdatesBuf?: string, longPollingTimeoutMs?: number}} batch - batch.
    * @returns {void}
    */
   push(batch) {
     if (this.waiter !== undefined) {
       const resolve = this.waiter
       this.waiter = undefined
-      resolve({ msgs: batch.msgs ?? [], getUpdatesBuf: batch.getUpdatesBuf, timedOut: false })
+      resolve(FakeClient.batchOf(batch))
       return
     }
     this.batches.push(batch)
@@ -46,10 +63,11 @@ export class FakeClient {
   /**
    * Long poll.
    *
-   * @param {{cursor: string, signal: AbortSignal}} options - poll options.
+   * @param {{cursor: string, timeoutMs?: number, signal: AbortSignal}} options - poll options.
    * @returns {Promise<object>} one batch.
    */
-  async getUpdates({ signal } = {}) {
+  async getUpdates({ timeoutMs, signal } = {}) {
+    this.pollTimeouts.push(timeoutMs)
     if (this.pausedOnce === 'pending') {
       this.pausedOnce = 'done'
       const error = new Error('iLink paused the account session (-14)')
@@ -57,8 +75,7 @@ export class FakeClient {
       throw error
     }
     if (this.batches.length > 0) {
-      const batch = this.batches.shift()
-      return { msgs: batch.msgs ?? [], getUpdatesBuf: batch.getUpdatesBuf, timedOut: false }
+      return FakeClient.batchOf(this.batches.shift())
     }
     return new Promise((resolve, reject) => {
       const onAbort = () => {

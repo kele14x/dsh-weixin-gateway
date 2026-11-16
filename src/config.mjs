@@ -14,6 +14,7 @@ import {
   DEFAULT_BASE_URL,
   DEFAULT_CDN_BASE,
   DEFAULT_POLL_TIMEOUT_MS,
+  MAX_POLL_TIMEOUT_MS,
   MAX_TEXT_CHARS,
   SESSION_PAUSED_MS,
 } from './ilink/constants.mjs'
@@ -80,8 +81,10 @@ export const Config = z.object({
     .description('Delay between consecutive outbound chunks, in milliseconds.'),
   pollTimeoutMs: z
     .natural()
+    .min(1)
+    .max(MAX_POLL_TIMEOUT_MS)
     .default(DEFAULT_POLL_TIMEOUT_MS)
-    .description('Long-poll budget; the server-suggested value wins when present.'),
+    .description('Long-poll budget, capped at MAX_POLL_TIMEOUT_MS; the server value wins when present and is capped too.'),
   queueLimit: z
     .natural()
     .default(8)
